@@ -1,0 +1,20 @@
+# GUI Framework
+PySide6>=6.6.0
+
+# Image handling
+Pillow>=9.5.0
+openslide-python>=1.2.0
+openslide-bin>=4.0.0  # Provides OpenSlide DLL files (required on Windows)
+
+# Numerical and data handling
+#numpy>=1.23.0
+pandas>=1.5.0
+
+# Machine learning
+scikit-learn>=1.2.0
+
+# HDF5 feature file loading
+h5py>=3.8.0
+
+# Optional: for unit testing
+pytest>=7.3.0
