@@ -16,5 +16,8 @@ scikit-learn>=1.2.0
 # HDF5 feature file loading
 h5py>=3.8.0
 
+# Geometry operations for annotation export
+shapely>=2.0.0
+
 # Optional: for unit testing
 pytest>=7.3.0

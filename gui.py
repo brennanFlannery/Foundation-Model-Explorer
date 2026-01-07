@@ -68,9 +68,13 @@ MainWindow
     user interactions.
 """
 from __future__ import annotations
+import json
 import os
+import uuid
 from typing import Dict, List, Optional, Tuple
 import numpy as np
+from shapely.geometry import box
+from shapely.ops import unary_union
 from PySide6.QtCore import Qt, QTimer, QPointF, QObject
 from PySide6.QtGui import QColor, QImage, QPixmap, QPainter
 from PySide6.QtWidgets import (
@@ -82,6 +86,7 @@ from PySide6.QtWidgets import (
     QGraphicsScene,
     QGraphicsView,
     QHBoxLayout,
+    QInputDialog,
     QLabel,
     QMainWindow,
     QMessageBox,
@@ -140,6 +145,12 @@ class MainWindow(QMainWindow):
         Patch coordinates scaled to thumbnail dimensions.
     _current_patch_size_thumb : float
         Patch size in thumbnail coordinate space.
+    _current_coords_lv0 : Optional[np.ndarray]
+        Patch coordinates at full resolution (level-0) for GeoJSON export.
+    _current_patch_size_lv0 : Optional[float]
+        Patch size at full resolution (level-0) for GeoJSON export.
+    _coord_scale_factor : Optional[float]
+        Scale factor from thumbnail to level-0 coordinates (slide_w / thumb_w).
     _active_cluster : Optional[int]
         Currently selected cluster number, used for persistent opacity styling.
     
@@ -165,6 +176,10 @@ class MainWindow(QMainWindow):
         Synchronize scatter point opacity with slide patch highlights.
     _on_animation_completed()
         Apply persistent styling when cascade animation finishes.
+    _merge_cluster_patches(cluster)
+        Merge adjacent patches into continuous polygons for GeoJSON export.
+    _on_export_clicked()
+        Handle export button click for GeoJSON annotation export.
     """
     def __init__(self) -> None:
         super().__init__()
@@ -185,6 +200,10 @@ class MainWindow(QMainWindow):
         self._hovered_scatter_idx: Optional[int] = None
         # Track active cluster for persistent opacity reduction
         self._active_cluster: Optional[int] = None
+        # Store level-0 coordinates for GeoJSON export
+        self._current_coords_lv0: Optional[np.ndarray] = None
+        self._current_patch_size_lv0: Optional[float] = None
+        self._coord_scale_factor: Optional[float] = None
 
     def _create_widgets(self) -> None:
         """Create and lay out widgets for the main window."""
@@ -224,6 +243,11 @@ class MainWindow(QMainWindow):
         self.cluster_spin.setValue(5)
         cluster_row.addWidget(QLabel("Clusters:"))
         cluster_row.addWidget(self.cluster_spin)
+        # Export annotation button (disabled until cluster selected)
+        self.export_button = QPushButton("Export Annotation")
+        self.export_button.setEnabled(False)
+        self.export_button.setToolTip("Export selected cluster as QuPath GeoJSON annotation")
+        cluster_row.addWidget(self.export_button)
         main_vbox.addLayout(cluster_row)
         
         # Progress bar for loading
@@ -271,6 +295,8 @@ class MainWindow(QMainWindow):
         self.mag_combo.currentTextChanged.connect(self._on_mag_changed)
         self.patch_combo.currentTextChanged.connect(self._on_patch_changed)
         self.cluster_spin.valueChanged.connect(self._on_cluster_changed)
+        # Export button for GeoJSON annotation export
+        self.export_button.clicked.connect(self._on_export_clicked)
 
         # Overlay checkbox toggles patch rect visibility
         self.overlay_checkbox.stateChanged.connect(self._on_overlay_toggled)
@@ -520,6 +546,8 @@ class MainWindow(QMainWindow):
         print(f"DEBUG: Scatter cluster selected {cluster}")
         # Set active cluster to maintain opacity reduction
         self._active_cluster = cluster
+        # Enable export button now that a cluster is selected
+        self.export_button.setEnabled(True)
         # Find cluster indices
         if self.graphics_view.labels is None:
             return
@@ -626,6 +654,8 @@ class MainWindow(QMainWindow):
         print(f"DEBUG: Preparing scatter for synchronized cascade, cluster {cluster}")
         # Set active cluster to maintain opacity reduction across panels
         self._active_cluster = cluster
+        # Enable export button now that a cluster is selected
+        self.export_button.setEnabled(True)
 
         # Baseline: set all scatter points to low opacity before cascade
         # The patches_highlighted signal will raise opacity for matching points
@@ -660,6 +690,165 @@ class MainWindow(QMainWindow):
         """
         print("DEBUG: Animation completed; applying persistent cluster styles")
         self._apply_active_cluster_styles()
+
+    def _merge_cluster_patches(self, cluster: int) -> List[List]:
+        """Merge adjacent patches into continuous polygons.
+        
+        Works in thumbnail space for efficiency, then scales to level-0
+        coordinates for QuPath-compatible GeoJSON export.
+        
+        Parameters
+        ----------
+        cluster : int
+            The cluster number to merge patches for.
+            
+        Returns
+        -------
+        List[List]
+            List of GeoJSON-ready polygon coordinate arrays. Each element
+            is a list of rings (outer ring + any holes), where each ring
+            is a list of [x, y] coordinate pairs in level-0 pixel units.
+        """
+        # Get patch indices for this cluster
+        if self.graphics_view.labels is None:
+            return []
+        indices = np.where(self.graphics_view.labels == cluster)[0]
+        if len(indices) == 0:
+            return []
+        
+        # Create Shapely boxes in thumbnail space for efficiency
+        boxes = []
+        for idx in indices:
+            x, y = self._current_coords_thumb[idx]
+            size = self._current_patch_size_thumb
+            boxes.append(box(x, y, x + size, y + size))
+        
+        # Merge all touching/overlapping boxes using unary_union
+        merged = unary_union(boxes)
+        
+        # Scale factor from thumbnail to level-0 coordinates
+        scale = self._coord_scale_factor
+        
+        # Handle Polygon vs MultiPolygon result
+        if merged.geom_type == 'Polygon':
+            polygons = [merged]
+        elif merged.geom_type == 'MultiPolygon':
+            polygons = list(merged.geoms)
+        else:
+            # Unexpected geometry type (GeometryCollection, etc.)
+            print(f"DEBUG: Unexpected geometry type from unary_union: {merged.geom_type}")
+            polygons = []
+        
+        # Convert to GeoJSON coordinate format, scaled to level-0
+        result = []
+        for poly in polygons:
+            coords = []
+            # Process exterior ring and any interior rings (holes)
+            for ring in [poly.exterior] + list(poly.interiors):
+                # Scale coordinates to level-0 and convert to nested lists
+                # Round to integers since QuPath expects pixel coordinates
+                scaled_ring = [[int(x * scale), int(y * scale)] for x, y in ring.coords]
+                coords.append(scaled_ring)
+            result.append(coords)
+        
+        print(f"DEBUG: Merged {len(indices)} patches into {len(result)} polygon(s)")
+        return result
+
+    def _on_export_clicked(self) -> None:
+        """Handle export button click: prompt for name and save GeoJSON.
+        
+        This method shows dialogs to get the annotation name and save
+        location, then generates a QuPath-compatible GeoJSON file with
+        merged polygon regions for the currently selected cluster.
+        """
+        if self._active_cluster is None:
+            QMessageBox.warning(self, "No Selection", 
+                "Please select a cluster first by clicking on the slide or scatter plot.")
+            return
+        
+        # Check if we have the required coordinate data
+        if self._current_coords_thumb is None or self._coord_scale_factor is None:
+            QMessageBox.warning(self, "No Data", 
+                "Please load a slide first.")
+            return
+        
+        # Dialog 1: Get annotation name
+        default_name = f"Cluster_{self._active_cluster}"
+        name, ok = QInputDialog.getText(
+            self, "Annotation Name",
+            "Enter a name for this annotation:",
+            text=default_name
+        )
+        if not ok or not name.strip():
+            return  # User cancelled
+        
+        annotation_name = name.strip()
+        
+        # Dialog 2: Get save location
+        file_path, _ = QFileDialog.getSaveFileName(
+            self, "Save Annotation",
+            f"{annotation_name}.geojson",
+            "GeoJSON Files (*.geojson);;All Files (*)"
+        )
+        if not file_path:
+            return  # User cancelled
+        
+        # Ensure .geojson extension
+        if not file_path.lower().endswith('.geojson'):
+            file_path += '.geojson'
+        
+        # Generate merged polygons
+        polygons = self._merge_cluster_patches(self._active_cluster)
+        
+        if not polygons:
+            QMessageBox.warning(self, "No Regions",
+                "No patches found for the selected cluster.")
+            return
+        
+        # Get cluster color for QuPath export
+        colours = generate_palette(int(self.graphics_view.labels.max()) + 1)
+        cluster_color_hsl = colours[self._active_cluster]
+        color_rgb = self._hsl_to_qupath_rgb(cluster_color_hsl)
+        
+        # Build GeoJSON FeatureCollection with QuPath-compatible properties
+        features = []
+        for coords in polygons:
+            feature = {
+                "type": "Feature",
+                "id": str(uuid.uuid4()),
+                "geometry": {
+                    "type": "Polygon",
+                    "coordinates": coords
+                },
+                "properties": {
+                    "objectType": "annotation",
+                    "classification": {
+                        "name": annotation_name,
+                        "colorRGB": color_rgb
+                    },
+                    "isLocked": False,
+                    "measurements": []
+                }
+            }
+            features.append(feature)
+        
+        geojson = {
+            "type": "FeatureCollection",
+            "features": features
+        }
+        
+        # Write file
+        try:
+            with open(file_path, 'w') as f:
+                json.dump(geojson, f, indent=2)
+            
+            QMessageBox.information(self, "Export Complete",
+                f"Exported {len(features)} region(s) to:\n{file_path}")
+            print(f"DEBUG: Exported GeoJSON with {len(features)} features to {file_path}")
+        except Exception as e:
+            QMessageBox.critical(self, "Export Failed",
+                f"Failed to write file:\n{e}")
+            print(f"DEBUG: Export failed: {e}")
 
     def _update_scatter_colours(self, labels: np.ndarray, colours: List[str]) -> None:
         """Update colours of existing scatter points based on new labels.
@@ -715,6 +904,10 @@ class MainWindow(QMainWindow):
             when the cluster count changes) without reloading images
             or coordinates.  Defaults to False.
         """
+        # Reset active cluster and disable export button when loading new data
+        self._active_cluster = None
+        self.export_button.setEnabled(False)
+        
         slide_name = self.slide_combo.currentText()
         model_name = self.model_combo.currentText()
         mag = self.mag_combo.currentText()
@@ -779,6 +972,10 @@ class MainWindow(QMainWindow):
             self._current_features = features
             self._current_coords_thumb = coords_thumb
             self._current_patch_size_thumb = (patch_size_lv0 * (thumb_w / float(slide_w)))
+            # Store level-0 coordinates for GeoJSON export
+            self._current_coords_lv0 = coords_lv0
+            self._current_patch_size_lv0 = patch_size_lv0
+            self._coord_scale_factor = float(slide_w) / float(thumb_w)
             # Compute clusters
             k = self.cluster_spin.value()
             print(f"DEBUG: Performing K-means clustering with k={k}")
@@ -832,6 +1029,32 @@ class MainWindow(QMainWindow):
         color = QColor()
         color.setHslF(h/360, s, l)
         return color
+
+    def _hsl_to_qupath_rgb(self, hsl_string: str) -> int:
+        """Convert HSL color string to QuPath packed ARGB integer.
+        
+        QuPath uses Java's signed 32-bit integer format for colors:
+        (alpha << 24) | (red << 16) | (green << 8) | blue
+        With alpha=255, this produces negative values due to signed overflow.
+        
+        Parameters
+        ----------
+        hsl_string : str
+            Color in format "hsl(H,S%,L%)" from generate_palette()
+            
+        Returns
+        -------
+        int
+            Packed ARGB integer compatible with QuPath's colorRGB field
+        """
+        qcolor = self._hsl_string_to_qcolor(hsl_string)
+        r, g, b = qcolor.red(), qcolor.green(), qcolor.blue()
+        # Pack as ARGB with alpha=255
+        packed = (255 << 24) | (r << 16) | (g << 8) | b
+        # Convert to signed 32-bit integer (Java style)
+        if packed >= 0x80000000:
+            packed -= 0x100000000
+        return int(packed)
 
     # --- colour utilities ---
     def _lighter_color(self, color: QColor, factor: int = 150) -> QColor:
