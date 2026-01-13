@@ -99,6 +99,9 @@ from PySide6.QtWidgets import (
     QCheckBox,
     QProgressBar,
 )
+from PySide6.QtGui import QAction
+from PySide6.QtCore import QSettings, QAbstractListModel, QModelIndex
+from PySide6.QtCore import Qt as QtCore
 from sklearn.decomposition import PCA
 from PySide6.QtGui import QPen, QBrush
 from PySide6.QtCore import QRectF
@@ -109,6 +112,202 @@ from PySide6.QtCore import Signal
 
 from scatter_view import ScatterGraphicsItem, ScatterGraphicsView
 from slide_view import SlideGraphicsView
+
+
+class CheckableComboBoxModel(QAbstractListModel):
+    """Model for QComboBox that supports checkable items."""
+    
+    def __init__(self, items: List[str] = None, parent=None):
+        super().__init__(parent)
+        self._items = items or []
+        self._checked = {item: False for item in self._items}
+        self._enabled = {item: True for item in self._items}
+        self._tooltips = {item: "" for item in self._items}
+    
+    def rowCount(self, parent=QModelIndex()):
+        return len(self._items)
+    
+    def data(self, index, role=QtCore.DisplayRole):
+        if not index.isValid():
+            return None
+        
+        item = self._items[index.row()]
+        
+        if role == QtCore.DisplayRole:
+            return item
+        elif role == QtCore.CheckStateRole:
+            return QtCore.Checked if self._checked[item] else QtCore.Unchecked
+        elif role == QtCore.ToolTipRole:
+            return self._tooltips.get(item, "")
+        
+        return None
+    
+    def setData(self, index, value, role=QtCore.CheckStateRole):
+        if not index.isValid():
+            return False
+        
+        item = self._items[index.row()]
+        
+        if role == QtCore.CheckStateRole and self._enabled[item]:
+            self._checked[item] = (value == QtCore.Checked)
+            self.dataChanged.emit(index, index, [role])
+            return True
+        
+        return False
+    
+    def flags(self, index):
+        if not index.isValid():
+            return QtCore.NoItemFlags
+        
+        item = self._items[index.row()]
+        flags = QtCore.ItemIsUserCheckable
+        
+        if self._enabled[item]:
+            flags |= QtCore.ItemIsEnabled
+        
+        return flags
+    
+    def setItems(self, items: List[str]):
+        """Set the list of items."""
+        self.beginResetModel()
+        self._items = items
+        self._checked = {item: False for item in items}
+        self._enabled = {item: True for item in items}
+        self._tooltips = {item: "" for item in items}
+        self.endResetModel()
+    
+    def getCheckedItems(self) -> List[str]:
+        """Return list of checked items."""
+        return [item for item in self._items if self._checked[item]]
+    
+    def setItemEnabled(self, item: str, enabled: bool):
+        """Enable or disable a specific item."""
+        if item in self._enabled:
+            self._enabled[item] = enabled
+            if not enabled:
+                self._checked[item] = False
+            # Find index and emit dataChanged
+            try:
+                idx = self._items.index(item)
+                model_index = self.index(idx)
+                self.dataChanged.emit(model_index, model_index)
+            except ValueError:
+                pass
+    
+    def setItemToolTip(self, item: str, tooltip: str):
+        """Set tooltip for a specific item."""
+        if item in self._tooltips:
+            self._tooltips[item] = tooltip
+
+
+class ModelMultiSelector(QComboBox):
+    """Dropdown combobox with checkable items for multi-model selection.
+    
+    This widget looks like a standard QComboBox but allows multiple
+    selections via checkboxes in the dropdown list. Selected models
+    are displayed as comma-separated text when the dropdown is closed.
+    
+    Signals
+    -------
+    selectionChanged : Signal
+        Emitted when the set of selected models changes.
+    """
+    selectionChanged = Signal()
+    
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        
+        # Set up model
+        self._model = CheckableComboBoxModel(parent=self)
+        self.setModel(self._model)
+        
+        # Prevent default selection behavior
+        self.setEditable(True)
+        self.lineEdit().setReadOnly(True)
+        self.lineEdit().setPlaceholderText("Select models...")
+        
+        # Connect model changes to update display text
+        self._model.dataChanged.connect(self._update_text)
+        
+        # Prevent closing dropdown on item click
+        self.view().viewport().installEventFilter(self)
+        
+        # Track selection state for deferred updates
+        self._selection_changed_while_open = False
+        self._previous_selection = set()
+    
+    def showPopup(self):
+        """Track selection state when popup opens."""
+        self._previous_selection = set(self.getSelectedModels())
+        self._selection_changed_while_open = False
+        print(f"DEBUG: Dropdown opened with selection: {self._previous_selection}")
+        super().showPopup()
+    
+    def hidePopup(self):
+        """Emit selectionChanged signal only when popup closes if selection changed."""
+        super().hidePopup()
+        
+        # Check if selection actually changed
+        current_selection = set(self.getSelectedModels())
+        if current_selection != self._previous_selection:
+            print(f"DEBUG: Dropdown closed, selection changed from {self._previous_selection} to {current_selection}")
+            self.selectionChanged.emit()
+        else:
+            print("DEBUG: Dropdown closed, no selection change")
+    
+    def eventFilter(self, obj, event):
+        """Prevent dropdown from closing when clicking checkboxes."""
+        if obj == self.view().viewport():
+            if event.type() == event.Type.MouseButtonRelease:
+                # Get the index at click position
+                index = self.view().indexAt(event.pos())
+                if index.isValid():
+                    # Toggle check state
+                    current_state = self._model.data(index, QtCore.CheckStateRole)
+                    new_state = QtCore.Unchecked if current_state == QtCore.Checked else QtCore.Checked
+                    self._model.setData(index, new_state, QtCore.CheckStateRole)
+                    self._selection_changed_while_open = True  # Mark that change occurred
+                return True  # Prevent dropdown from closing
+        
+        return super().eventFilter(obj, event)
+    
+    def _update_text(self):
+        """Update the display text to show selected items.
+        
+        Note: Signal emission is deferred until dropdown closes (see hidePopup).
+        """
+        selected = self._model.getCheckedItems()
+        if selected:
+            self.lineEdit().setText(", ".join(selected))
+        else:
+            self.lineEdit().setText("")
+        # Signal will be emitted only when dropdown closes
+    
+    def clear(self):
+        """Clear all items."""
+        self._model.setItems([])
+        self.lineEdit().clear()
+    
+    def addItems(self, items: List[str]):
+        """Add model names as checkable items."""
+        self._model.setItems(items)
+        self.lineEdit().clear()
+    
+    def getSelectedModels(self) -> List[str]:
+        """Return list of selected model names."""
+        return self._model.getCheckedItems()
+    
+    def getAllModelNames(self) -> List[str]:
+        """Return list of all available model names (not just selected)."""
+        return self._model._items.copy()
+    
+    def setModelEnabled(self, model_name: str, enabled: bool):
+        """Enable or disable a specific model item."""
+        self._model.setItemEnabled(model_name, enabled)
+    
+    def setModelToolTip(self, model_name: str, tooltip: str):
+        """Set tooltip for a specific model item."""
+        self._model.setItemToolTip(model_name, tooltip)
 
 class MainWindow(QMainWindow):
     """Main application window for FoundationDetector.
@@ -189,6 +388,9 @@ class MainWindow(QMainWindow):
         # Storage for scatter plot items
         self._scatter_items: List[QGraphicsEllipseItem] = []
         self._current_embedding: Optional[np.ndarray] = None
+        # Load preferences
+        self.settings = QSettings("FoundationDetector", "FoundationDetector")
+        self.normalize_features = self.settings.value("normalize_features", True, type=bool)
         # UI components
         self._create_widgets()
         self._connect_signals()
@@ -204,17 +406,20 @@ class MainWindow(QMainWindow):
         self._current_coords_lv0: Optional[np.ndarray] = None
         self._current_patch_size_lv0: Optional[float] = None
         self._coord_scale_factor: Optional[float] = None
+        # Track cascade animation state to prevent hover interference
+        self._animation_in_progress: bool = False
 
     def _create_widgets(self) -> None:
         """Create and lay out widgets for the main window."""
+        # Create menu bar
+        self._create_menu_bar()
+        
         central = QWidget()
         self.setCentralWidget(central)
         main_vbox = QVBoxLayout(central)
         
-        # Folder selection row
+        # Folder selection row (button removed - now in File menu)
         folder_row = QHBoxLayout()
-        self.select_folder_button = QPushButton("Select Folder")
-        folder_row.addWidget(self.select_folder_button)
         self.root_label = QLabel("No folder selected")
         folder_row.addWidget(self.root_label)
         main_vbox.addLayout(folder_row)
@@ -225,9 +430,12 @@ class MainWindow(QMainWindow):
         self.slide_combo.setPlaceholderText("Select slide")
         dropdown_row.addWidget(QLabel("Slide:"))
         dropdown_row.addWidget(self.slide_combo)
-        self.model_combo = QComboBox()
-        dropdown_row.addWidget(QLabel("Model:"))
-        dropdown_row.addWidget(self.model_combo)
+        
+        # Model multi-selector dropdown
+        self.model_selector = ModelMultiSelector()
+        dropdown_row.addWidget(QLabel("Models:"))
+        dropdown_row.addWidget(self.model_selector)
+        
         self.mag_combo = QComboBox()
         dropdown_row.addWidget(QLabel("Magnification:"))
         dropdown_row.addWidget(self.mag_combo)
@@ -243,11 +451,6 @@ class MainWindow(QMainWindow):
         self.cluster_spin.setValue(5)
         cluster_row.addWidget(QLabel("Clusters:"))
         cluster_row.addWidget(self.cluster_spin)
-        # Export annotation button (disabled until cluster selected)
-        self.export_button = QPushButton("Export Annotation")
-        self.export_button.setEnabled(False)
-        self.export_button.setToolTip("Export selected cluster as QuPath GeoJSON annotation")
-        cluster_row.addWidget(self.export_button)
         main_vbox.addLayout(cluster_row)
         
         # Progress bar for loading
@@ -255,10 +458,12 @@ class MainWindow(QMainWindow):
         self.progress_bar.setRange(0, 0)  # indeterminate by default
         self.progress_bar.setVisible(False)
         main_vbox.addWidget(self.progress_bar)
-        # Overlay toggle
-        self.overlay_checkbox = QCheckBox("Show overlays")
-        self.overlay_checkbox.setChecked(True)
-        main_vbox.addWidget(self.overlay_checkbox)
+        
+        # Status label showing selected models and feature dimensions
+        self.status_label = QLabel("")
+        self.status_label.setStyleSheet("color: gray; font-size: 9pt;")
+        self.status_label.setWordWrap(True)
+        main_vbox.addWidget(self.status_label)
         # Create horizontal layout for the two panels
         panels_layout = QHBoxLayout()
         # Left panel: Slide view
@@ -287,19 +492,68 @@ class MainWindow(QMainWindow):
         # Set starting size
         self.resize(1200, 800)
 
+    def _create_menu_bar(self) -> None:
+        """Create menu bar with File, View, and Help menus."""
+        # File Menu
+        file_menu = self.menuBar().addMenu("&File")
+        
+        # Open Folder (replaces select_folder_button)
+        open_action = QAction("Open Folder...", self)
+        open_action.setShortcut("Ctrl+O")
+        open_action.triggered.connect(self._select_folder)
+        file_menu.addAction(open_action)
+        
+        file_menu.addSeparator()
+        
+        # Export GeoJSON (replaces export_button functionality)
+        self.export_action = QAction("Export Cluster as GeoJSON...", self)
+        self.export_action.setShortcut("Ctrl+E")
+        self.export_action.setEnabled(False)  # Enable when cluster selected
+        self.export_action.triggered.connect(self._on_export_clicked)
+        file_menu.addAction(self.export_action)
+        
+        file_menu.addSeparator()
+        
+        # Preferences
+        prefs_action = QAction("Preferences...", self)
+        prefs_action.setShortcut("Ctrl+,")
+        prefs_action.triggered.connect(self._show_preferences)
+        file_menu.addAction(prefs_action)
+        
+        file_menu.addSeparator()
+        
+        # Exit
+        exit_action = QAction("Exit", self)
+        exit_action.setShortcut("Ctrl+Q")
+        exit_action.triggered.connect(self.close)
+        file_menu.addAction(exit_action)
+        
+        # View Menu
+        view_menu = self.menuBar().addMenu("&View")
+        
+        # Show Patch Overlays (replaces overlay_checkbox)
+        self.overlay_action = QAction("Show Patch Overlays", self)
+        self.overlay_action.setShortcut("Ctrl+1")
+        self.overlay_action.setCheckable(True)
+        self.overlay_action.setChecked(True)
+        self.overlay_action.triggered.connect(self._on_overlay_toggled)
+        view_menu.addAction(self.overlay_action)
+        
+        # Help Menu
+        help_menu = self.menuBar().addMenu("&Help")
+        
+        # About
+        about_action = QAction("About FoundationDetector", self)
+        about_action.triggered.connect(self._show_about)
+        help_menu.addAction(about_action)
+
     def _connect_signals(self) -> None:
         """Connect signals and slots for interactive widgets."""
-        self.select_folder_button.clicked.connect(self._select_folder)
         self.slide_combo.currentTextChanged.connect(self._on_slide_changed)
-        self.model_combo.currentTextChanged.connect(self._on_model_changed)
+        self.model_selector.selectionChanged.connect(self._on_model_selection_changed)
         self.mag_combo.currentTextChanged.connect(self._on_mag_changed)
         self.patch_combo.currentTextChanged.connect(self._on_patch_changed)
         self.cluster_spin.valueChanged.connect(self._on_cluster_changed)
-        # Export button for GeoJSON annotation export
-        self.export_button.clicked.connect(self._on_export_clicked)
-
-        # Overlay checkbox toggles patch rect visibility
-        self.overlay_checkbox.stateChanged.connect(self._on_overlay_toggled)
 
     # ---- Handlers ----
 
@@ -323,8 +577,8 @@ class MainWindow(QMainWindow):
             print(f"DEBUG: Adding slides to combo box: {slide_names}")
             self.slide_combo.addItems(slide_names)
             
-            # Clear subsequent combos and view
-            self.model_combo.clear()
+            # Clear subsequent selectors and view
+            self.model_selector.clear()
             self.mag_combo.clear()
             self.patch_combo.clear()
             self.graphics_view.scene().clear()
@@ -337,7 +591,7 @@ class MainWindow(QMainWindow):
             return
 
     def _on_slide_changed(self, slide_name: str) -> None:
-        """Update model/mag/patch combos when a new slide is selected."""
+        """Update model selector and mag/patch combos when a new slide is selected."""
         print(f"DEBUG: Slide changed to: {slide_name}")
         if not slide_name:
             print("DEBUG: No slide name provided")
@@ -348,47 +602,48 @@ class MainWindow(QMainWindow):
             return
         
         print(f"DEBUG: Found slide info: {info}")
-        # Populate model combo
-        self.model_combo.blockSignals(True)
-        self.mag_combo.blockSignals(True)
-        self.patch_combo.blockSignals(True)
-        
-        self.model_combo.clear()
+        # Populate model selector
+        self.model_selector.clear()
         model_names = sorted(info.models.keys())
-        print(f"DEBUG: Adding models to combo box: {model_names}")
-        self.model_combo.addItems(model_names)
+        print(f"DEBUG: Adding models to selector: {model_names}")
+        self.model_selector.addItems(model_names)
         
         self.mag_combo.clear()
         self.patch_combo.clear()
-        
-        self.model_combo.blockSignals(False)
-        self.mag_combo.blockSignals(False)
-        self.patch_combo.blockSignals(False)
-        
-        # Set initial model and manually trigger the change
-        if self.model_combo.count() > 0:
-            self.model_combo.setCurrentIndex(0)
-            # Manually trigger the model changed signal
-            self._on_model_changed(self.model_combo.currentText())
 
-    def _on_model_changed(self, model_name: str) -> None:
-        """Update magnification combo when model changes."""
+    def _on_model_selection_changed(self) -> None:
+        """Update magnification combo when model selection changes."""
         slide_name = self.slide_combo.currentText()
-        if not slide_name or not model_name:
+        if not slide_name:
             return
         info = self.slides.get(slide_name)
         if info is None:
             return
-
-        # Get available magnifications for this model
-        model_dict = info.models.get(model_name, {})
-        print(f"DEBUG: Available magnifications for model {model_name}: {list(model_dict.keys())}")
+        
+        selected_models = self.model_selector.getSelectedModels()
+        print(f"DEBUG: Selected models changed: {selected_models}")
+        
+        if len(selected_models) == 0:
+            # No models selected - clear everything
+            self.mag_combo.clear()
+            self.patch_combo.clear()
+            return
+        
+        # Find intersection of available magnifications across all selected models
+        mag_sets = []
+        for model_name in selected_models:
+            model_dict = info.models.get(model_name, {})
+            mag_sets.append(set(model_dict.keys()))
+        
+        common_mags = set.intersection(*mag_sets) if mag_sets else set()
+        print(f"DEBUG: Common magnifications across selected models: {common_mags}")
         
         self.mag_combo.blockSignals(True)
         self.patch_combo.blockSignals(True)
         
         self.mag_combo.clear()
-        self.mag_combo.addItems(sorted(model_dict.keys()))
+        if common_mags:
+            self.mag_combo.addItems(sorted(common_mags))
         self.patch_combo.clear()
         
         self.mag_combo.blockSignals(False)
@@ -399,24 +654,36 @@ class MainWindow(QMainWindow):
             self.mag_combo.setCurrentIndex(0)
             # Manually trigger the magnification changed signal
             self._on_mag_changed(self.mag_combo.currentText())
+            
+            # Explicitly trigger data loading if mag and patch are valid
+            # (in case they didn't change but model selection did)
+            if self.mag_combo.currentText() and self.patch_combo.currentText():
+                print("DEBUG: Model selection changed with valid mag/patch; triggering data load")
+                self._on_patch_changed(self.patch_combo.currentText())
 
     def _on_mag_changed(self, mag: str) -> None:
         """Update patch combo when magnification changes."""
         slide_name = self.slide_combo.currentText()
-        model_name = self.model_combo.currentText()
-        if not slide_name or not model_name or not mag:
+        selected_models = self.model_selector.getSelectedModels()
+        if not slide_name or not selected_models or not mag:
             return
         info = self.slides.get(slide_name)
         if info is None:
             return
 
-        # Get available patch sizes for this magnification
-        patch_sizes = info.models.get(model_name, {}).get(mag, {})
-        print(f"DEBUG: Available patch sizes for magnification {mag}: {list(patch_sizes.keys())}")
+        # Find intersection of available patch sizes across all selected models
+        patch_sets = []
+        for model_name in selected_models:
+            patch_sizes = info.models.get(model_name, {}).get(mag, {})
+            patch_sets.append(set(patch_sizes.keys()))
+        
+        common_patches = set.intersection(*patch_sets) if patch_sets else set()
+        print(f"DEBUG: Common patch sizes for magnification {mag}: {common_patches}")
         
         self.patch_combo.blockSignals(True)
         self.patch_combo.clear()
-        self.patch_combo.addItems(sorted(patch_sizes.keys()))
+        if common_patches:
+            self.patch_combo.addItems(sorted(common_patches))
         self.patch_combo.blockSignals(False)
         
         # Trigger update for new patch size
@@ -426,6 +693,8 @@ class MainWindow(QMainWindow):
 
     def _on_patch_changed(self, patch: str) -> None:
         """Load new data when patch size changes."""
+        # Validate model compatibility before loading
+        self._validate_model_compatibility()
         self._load_current_data()
 
     def _on_cluster_changed(self, k: int) -> None:
@@ -433,20 +702,19 @@ class MainWindow(QMainWindow):
         print(f"DEBUG: Cluster spin changed to {k}; reclustering current features")
         self._load_current_data(recluster_only=True)
 
-    def _on_overlay_toggled(self, state: int) -> None:
-        """Show or hide patch overlays based on checkbox state."""
-        visible = bool(state)
-        print(f"DEBUG: Overlay toggled; visible={visible}")
+    def _on_overlay_toggled(self, checked: bool) -> None:
+        """Show or hide patch overlays based on menu action state."""
+        print(f"DEBUG: Overlay toggled; visible={checked}")
         # Adjust visibility of patch rects
         for rect in getattr(self.graphics_view, 'rect_items', []):
-            if visible:
-                rect.setVisible(True)
-            else:
-                rect.setVisible(False)
+            rect.setVisible(checked)
 
     def _on_slide_patch_hovered(self, idx: int, state: bool) -> None:
         """Highlight the scatter point corresponding to the hovered slide patch."""
         if not self.scatter_view:
+            return
+        # Skip scatter opacity changes if animation is in progress
+        if self._animation_in_progress:
             return
         # When hover leaves or invalid index
         if idx == -1 or not state:
@@ -506,6 +774,10 @@ class MainWindow(QMainWindow):
 
         if not state or idx < 0 or idx >= len(self.graphics_view.rect_items):
             _clear_previous_hover()
+            # Skip scatter opacity changes if animation is in progress
+            # to avoid interrupting the cascade effect
+            if self._animation_in_progress:
+                return
             # Restore scatter opacities based on whether a cluster is active
             if self._active_cluster is None:
                 # No active selection: return all points to medium opacity
@@ -546,8 +818,11 @@ class MainWindow(QMainWindow):
         print(f"DEBUG: Scatter cluster selected {cluster}")
         # Set active cluster to maintain opacity reduction
         self._active_cluster = cluster
-        # Enable export button now that a cluster is selected
-        self.export_button.setEnabled(True)
+        # Enable export action now that a cluster is selected
+        self.export_action.setEnabled(True)
+        # Mark animation as in progress to prevent hover interference
+        self._animation_in_progress = True
+        self.scatter_view.set_animation_active(True)
         # Find cluster indices
         if self.graphics_view.labels is None:
             return
@@ -654,8 +929,11 @@ class MainWindow(QMainWindow):
         print(f"DEBUG: Preparing scatter for synchronized cascade, cluster {cluster}")
         # Set active cluster to maintain opacity reduction across panels
         self._active_cluster = cluster
-        # Enable export button now that a cluster is selected
-        self.export_button.setEnabled(True)
+        # Enable export action now that a cluster is selected
+        self.export_action.setEnabled(True)
+        # Mark animation as in progress to prevent hover interference
+        self._animation_in_progress = True
+        self.scatter_view.set_animation_active(True)
 
         # Baseline: set all scatter points to low opacity before cascade
         # The patches_highlighted signal will raise opacity for matching points
@@ -689,6 +967,9 @@ class MainWindow(QMainWindow):
         between selected and non-selected clusters.
         """
         print("DEBUG: Animation completed; applying persistent cluster styles")
+        # Mark animation as complete
+        self._animation_in_progress = False
+        self.scatter_view.set_animation_active(False)
         self._apply_active_cluster_styles()
 
     def _merge_cluster_patches(self, cluster: int) -> List[List]:
@@ -904,38 +1185,96 @@ class MainWindow(QMainWindow):
             when the cluster count changes) without reloading images
             or coordinates.  Defaults to False.
         """
-        # Reset active cluster and disable export button when loading new data
+        # Reset active cluster and disable export action when loading new data
         self._active_cluster = None
-        self.export_button.setEnabled(False)
+        self.export_action.setEnabled(False)
         
         slide_name = self.slide_combo.currentText()
-        model_name = self.model_combo.currentText()
+        selected_models = self._get_selected_models()
         mag = self.mag_combo.currentText()
         patch = self.patch_combo.currentText()
-        if not all([slide_name, model_name, mag, patch]):
+        
+        if not all([slide_name, mag, patch]):
             print("DEBUG: Incomplete selection; cannot load data")
             return
+        
+        if len(selected_models) == 0:
+            print("DEBUG: No models selected; cannot load data")
+            QMessageBox.warning(self, "No Models Selected", 
+                "Please select at least one model to visualize.")
+            return
+        
         info = self.slides.get(slide_name)
         if info is None:
             print(f"DEBUG: Slide info not found for {slide_name}")
             return
-        h5_path = info.models.get(model_name, {}).get(mag, {}).get(patch)
-        if h5_path is None:
-            print(f"DEBUG: H5 path not found for selected configuration: {slide_name}, {model_name}, {mag}, {patch}")
-            return
+        
         # If not reclustering, load features and image afresh
         if not recluster_only or self.graphics_view.coords is None:
             # Show progress bar
             self.progress_bar.setVisible(True)
             QApplication.processEvents()
+            
+            # Load features from multiple models
+            feature_list = []
+            coords_lv0 = None
+            patch_size_lv0 = None
+            
             try:
-                print(f"DEBUG: Loading features from {h5_path}")
-                # Load features and coordinates
-                features, coords_lv0, patch_size_lv0 = data_loader.load_features(h5_path)
-                print(f"DEBUG: Loaded {features.shape[0]} feature vectors of dimension {features.shape[1]}")
+                for model_name in selected_models:
+                    h5_path = info.models.get(model_name, {}).get(mag, {}).get(patch)
+                    if h5_path is None:
+                        print(f"DEBUG: H5 path not found for {model_name}")
+                        QMessageBox.critical(self, "Error", 
+                            f"Features not found for model: {model_name}")
+                        self.progress_bar.setVisible(False)
+                        return
+                    
+                    print(f"DEBUG: Loading features from {model_name}: {h5_path}")
+                    model_features, model_coords, model_patch_size = data_loader.load_features(h5_path)
+                    print(f"DEBUG: Loaded {model_features.shape[0]} features of dimension {model_features.shape[1]} for {model_name}")
+                    
+                    # Validate coordinates match (runtime check)
+                    if coords_lv0 is None:
+                        coords_lv0 = model_coords
+                        patch_size_lv0 = model_patch_size
+                    else:
+                        if not np.allclose(coords_lv0, model_coords, atol=1.0):
+                            QMessageBox.critical(self, "Coordinate Mismatch",
+                                f"Model {model_name} has incompatible patch coordinates. "
+                                f"Please select only compatible models.")
+                            self.progress_bar.setVisible(False)
+                            return
+                    
+                    # Apply z-score normalization if preference enabled
+                    if self.normalize_features:
+                        print(f"DEBUG: Applying z-score normalization to {model_name} features")
+                        model_features = self._normalize_features_zscore(model_features)
+                    
+                    feature_list.append(model_features)
+                
+                # Concatenate features along feature dimension (axis=1)
+                if len(feature_list) == 1:
+                    features = feature_list[0]
+                else:
+                    features = np.concatenate(feature_list, axis=1)
+                    print(f"DEBUG: Concatenated features from {len(feature_list)} models")
+                
+                print(f"DEBUG: Final feature array shape: {features.shape[0]} patches × {features.shape[1]} dimensions")
+                
+                # Update status label
+                model_str = ", ".join(selected_models)
+                norm_str = " (normalized)" if self.normalize_features else ""
+                self.status_label.setText(
+                    f"Models: {model_str} | "
+                    f"Features: {features.shape[1]} dims{norm_str} | "
+                    f"Patches: {features.shape[0]}"
+                )
+                
             except Exception as e:
                 print(f"DEBUG: Error loading features: {e}")
                 QMessageBox.critical(self, "Error", f"Failed to load features:\n{e}")
+                self.progress_bar.setVisible(False)
                 return
             # Compute PCA embedding
             pca = PCA(n_components=2)
@@ -1075,3 +1414,146 @@ class MainWindow(QMainWindow):
         """
         c = QColor(color)
         return c.lighter(factor)
+
+    # --- helper methods ---
+    def _get_selected_models(self) -> List[str]:
+        """Get list of currently selected model names."""
+        return self.model_selector.getSelectedModels()
+    
+    def _normalize_features_zscore(self, features: np.ndarray) -> np.ndarray:
+        """Z-score normalize features (mean=0, std=1) per dimension.
+        
+        This normalization ensures that each feature dimension contributes
+        equally to subsequent analysis (PCA, clustering), regardless of
+        the original scale or magnitude of the features.
+        
+        Parameters
+        ----------
+        features : np.ndarray
+            Feature array of shape (n_patches, feature_dim)
+        
+        Returns
+        -------
+        np.ndarray
+            Normalized features with same shape as input
+        """
+        from sklearn.preprocessing import StandardScaler
+        scaler = StandardScaler()
+        return scaler.fit_transform(features)
+    
+    def _validate_model_compatibility(self) -> None:
+        """Validate coordinate compatibility and disable incompatible models.
+        
+        This method checks if all selected models have matching patch coordinates.
+        If incompatibilities are found, incompatible models are disabled in the UI
+        with tooltips explaining the issue.
+        """
+        slide_name = self.slide_combo.currentText()
+        if not slide_name:
+            return
+        
+        info = self.slides.get(slide_name)
+        if info is None:
+            return
+        
+        selected_models = self._get_selected_models()
+        if len(selected_models) == 0:
+            # No models selected - enable all
+            for model_name in self.model_selector.getAllModelNames():
+                self.model_selector.setModelEnabled(model_name, True)
+                self.model_selector.setModelToolTip(model_name, "")
+            return
+        
+        # Get current mag and patch to check compatibility
+        mag = self.mag_combo.currentText()
+        patch = self.patch_combo.currentText()
+        if not mag or not patch:
+            return
+        
+        # Load coordinates from first selected model
+        try:
+            first_model = selected_models[0]
+            h5_path = info.models.get(first_model, {}).get(mag, {}).get(patch)
+            if not h5_path:
+                return
+            
+            _, ref_coords, _ = data_loader.load_features(h5_path)
+            
+            # Check all other models in the selector
+            for model_name in self.model_selector.getAllModelNames():
+                if model_name in selected_models:
+                    continue  # Skip already selected models
+                
+                # Check if this model has features for current mag/patch
+                model_h5_path = info.models.get(model_name, {}).get(mag, {}).get(patch)
+                if not model_h5_path:
+                    self.model_selector.setModelEnabled(model_name, False)
+                    self.model_selector.setModelToolTip(
+                        model_name,
+                        f"Not available for {mag}/{patch}"
+                    )
+                    continue
+                
+                # Load and compare coordinates
+                try:
+                    _, model_coords, _ = data_loader.load_features(model_h5_path)
+                    
+                    # Check coordinate compatibility
+                    if model_coords.shape != ref_coords.shape:
+                        self.model_selector.setModelEnabled(model_name, False)
+                        self.model_selector.setModelToolTip(
+                            model_name,
+                            f"Incompatible: Different number of patches "
+                            f"({model_coords.shape[0]} vs {ref_coords.shape[0]})"
+                        )
+                    elif not np.allclose(model_coords, ref_coords, atol=1.0):
+                        self.model_selector.setModelEnabled(model_name, False)
+                        self.model_selector.setModelToolTip(
+                            model_name,
+                            "Incompatible: Patch coordinates do not match"
+                        )
+                    else:
+                        # Compatible - enable it
+                        self.model_selector.setModelEnabled(model_name, True)
+                        self.model_selector.setModelToolTip(model_name, "")
+                except Exception as e:
+                    print(f"DEBUG: Error checking compatibility for {model_name}: {e}")
+                    self.model_selector.setModelEnabled(model_name, False)
+                    self.model_selector.setModelToolTip(
+                        model_name,
+                        f"Error loading features: {str(e)}"
+                    )
+        except Exception as e:
+            print(f"DEBUG: Error in validation: {e}")
+            # On error, enable all models
+            for model_name in self.model_selector.getAllModelNames():
+                self.model_selector.setModelEnabled(model_name, True)
+                self.model_selector.setModelToolTip(model_name, "")
+    
+    # --- preferences and about dialogs ---
+    def _show_preferences(self) -> None:
+        """Display preferences dialog."""
+        from preferences_dialog import PreferencesDialog
+        dialog = PreferencesDialog(self)
+        if dialog.exec():
+            # Reload preferences after dialog closes
+            self.normalize_features = self.settings.value("normalize_features", True, type=bool)
+    
+    def _show_about(self) -> None:
+        """Display About dialog with version and attribution."""
+        about_text = """
+        <h3>FoundationDetector</h3>
+        <p><b>Version:</b> 1.0.0</p>
+        <p>Interactive exploration of whole-slide image patches using 
+        foundation model embeddings.</p>
+        <p><b>Features:</b></p>
+        <ul>
+            <li>Multi-model feature concatenation</li>
+            <li>PCA dimensionality reduction</li>
+            <li>K-means clustering with interactive visualization</li>
+            <li>QuPath GeoJSON annotation export</li>
+        </ul>
+        <p><b>License:</b> MIT</p>
+        <p><b>Authors:</b> FoundationDetector Contributors</p>
+        """
+        QMessageBox.about(self, "About FoundationDetector", about_text)

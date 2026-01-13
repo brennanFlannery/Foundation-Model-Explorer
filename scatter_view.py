@@ -96,6 +96,9 @@ class ScatterGraphicsItem(QObject, QGraphicsEllipseItem):
         original feature array.
     _base_color : QColor
         The base color assigned to this point based on its cluster.
+    _animation_active : bool
+        When True, hover events will not change opacity to avoid
+        interfering with cascade animations.
     
     Signals
     -------
@@ -120,16 +123,32 @@ class ScatterGraphicsItem(QObject, QGraphicsEllipseItem):
         self.setPen(Qt.NoPen)
         self.setAcceptHoverEvents(True)
         self.setOpacity(0.6)
+        # Track cascade animation state to prevent hover interference
+        self._animation_active: bool = False
+
+    def set_animation_active(self, active: bool) -> None:
+        """Set whether a cascade animation is in progress.
+        
+        Parameters
+        ----------
+        active : bool
+            True if cascade animation is in progress, False otherwise.
+        """
+        self._animation_active = active
 
     def hoverEnterEvent(self, event):
-        # Increase opacity to indicate hover
-        self.setOpacity(1.0)
+        # Skip opacity change during cascade animation
+        if not self._animation_active:
+            # Increase opacity to indicate hover
+            self.setOpacity(1.0)
         self.hovered.emit(self.index, True)
         super().hoverEnterEvent(event)
 
     def hoverLeaveEvent(self, event):
-        # Restore opacity
-        self.setOpacity(0.6)
+        # Skip opacity change during cascade animation
+        if not self._animation_active:
+            # Restore opacity
+            self.setOpacity(0.6)
         self.hovered.emit(self.index, False)
         super().hoverLeaveEvent(event)
 
@@ -207,6 +226,8 @@ class ScatterGraphicsView(QGraphicsView):
         self._scatter_items: List[ScatterGraphicsItem] = []
         self.labels: Optional[np.ndarray] = None
         self.cluster_colors: List[QColor] = []
+        # Track cascade animation state to prevent hover interference
+        self._animation_active: bool = False
 
     def populate(self, coords_2d: np.ndarray, labels: np.ndarray, colors: List[str]) -> None:
         """Populate the scatter scene with points.
@@ -274,6 +295,22 @@ class ScatterGraphicsView(QGraphicsView):
             target_opacity = 1.0 if on else 0.6
             print(f"DEBUG: Setting scatter point {index} opacity to {target_opacity}")
             self._scatter_items[index].setOpacity(target_opacity)
+
+    def set_animation_active(self, active: bool) -> None:
+        """Set whether a cascade animation is in progress.
+        
+        When active, scatter items will skip hover opacity changes to
+        avoid interfering with the synchronized cascade animation.
+        
+        Parameters
+        ----------
+        active : bool
+            True if cascade animation is in progress, False otherwise.
+        """
+        self._animation_active = active
+        # Propagate to all scatter items
+        for item in self._scatter_items:
+            item.set_animation_active(active)
 
     def wheelEvent(self, event) -> None:
         """Zoom in/out with mouse wheel."""

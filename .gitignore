@@ -31,3 +31,12 @@ Thumbs.db
 
 # Jupyter notebooks
 .ipynb_checkpoints/
+
+# Example data folder
+FM-Explorer-Examples/
+
+# Documentation and reports
+Reports/
+
+# Exported annotation files
+*.geojson
