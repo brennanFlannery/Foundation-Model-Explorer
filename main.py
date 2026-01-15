@@ -58,6 +58,7 @@ main()
 """
 
 from PySide6.QtWidgets import QApplication
+from PySide6.QtCore import Qt
 import os
 import sys
 
@@ -92,6 +93,8 @@ def main() -> None:
         this script is typically run as a standalone application.
     """
     app = QApplication([])
+    # Enable high DPI support for better scaling on modern displays
+    # Note: AA_UseHighDpiPixmaps deprecated in Qt6, handled automatically
     window = MainWindow()
     window.show()
     # Start the Qt event loop.  Note: app.exec() returns an integer exit

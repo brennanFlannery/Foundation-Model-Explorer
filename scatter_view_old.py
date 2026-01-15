@@ -29,8 +29,8 @@ from __future__ import annotations
 import os
 from typing import Dict, List, Optional, Tuple
 import numpy as np
-from PySide6.QtCore import Qt, QTimer, QPointF, QPoint, QObject
-from PySide6.QtGui import QColor, QImage, QPixmap, QPainter, QCursor
+from PySide6.QtCore import Qt, QTimer, QPointF, QObject
+from PySide6.QtGui import QColor, QImage, QPixmap, QPainter
 from PySide6.QtWidgets import (
     QApplication,
     QFileDialog,
@@ -57,7 +57,7 @@ from PySide6.QtGui import QPen, QBrush
 from PySide6.QtCore import QRectF
 from PIL import Image
 import data_loader
-from utils import generate_palette, cluster_features, infer_slide_dims, radial_sweep_order, normalize_to_scene
+from utils import generate_palette, cluster_features, infer_slide_dims, radial_sweep_order
 from PySide6.QtCore import Signal
 
 
@@ -110,7 +110,7 @@ class ScatterGraphicsItem(QObject, QGraphicsEllipseItem):
         parameter is the item's index, the second is True on enter
         and False on leave.
     """
-    clicked = Signal(int, bool)
+    clicked = Signal(int)
     hovered = Signal(int, bool)  # index and hover state
 
     def __init__(self, index: int, x: float, y: float, radius: float, color: QColor):
@@ -154,8 +154,7 @@ class ScatterGraphicsItem(QObject, QGraphicsEllipseItem):
 
     def mousePressEvent(self, event):
         if event.button() == Qt.LeftButton:
-            ctrl_pressed = bool(event.modifiers() & Qt.ControlModifier)
-            self.clicked.emit(self.index, ctrl_pressed)
+            self.clicked.emit(self.index)
         super().mousePressEvent(event)
 
 class ScatterGraphicsView(QGraphicsView):
@@ -202,7 +201,7 @@ class ScatterGraphicsView(QGraphicsView):
         parameter is the point index, the second is True on enter and
         False on leave.
     """
-    cluster_selected = Signal(int, bool)
+    cluster_selected = Signal(int)
     point_hovered = Signal(int, bool)  # index and hover state
 
     def __init__(self, parent: Optional[QWidget] = None):
@@ -219,9 +218,9 @@ class ScatterGraphicsView(QGraphicsView):
         # Enable antialiasing for smooth points
         self.setRenderHints(self.renderHints() | QPainter.Antialiasing)
         # Anchor zooming around the mouse position
-        self.setTransformationAnchor(QGraphicsView.ViewportAnchor.AnchorUnderMouse)
+        self.setTransformationAnchor(QGraphicsView.AnchorUnderMouse)
         # Do not enable automatic hand drag; we will use a cross cursor
-        self.setDragMode(QGraphicsView.DragMode.NoDrag)
+        self.setDragMode(QGraphicsView.NoDrag)
         # Set a cross‑hair cursor for precise point selection
         self.setCursor(Qt.CursorShape.CrossCursor)
         self._scatter_items: List[ScatterGraphicsItem] = []
@@ -229,124 +228,95 @@ class ScatterGraphicsView(QGraphicsView):
         self.cluster_colors: List[QColor] = []
         # Track cascade animation state to prevent hover interference
         self._animation_active: bool = False
-        # Variable to track middle-click panning state
-        self._was_panning = False
-        self._suppress_clicks = False
-
-    def set_animation_active(self, active: bool) -> None:
-        """Set whether a cascade animation is in progress."""
-        self._animation_active = active
-        # Propagate to all scatter items
-        for item in self._scatter_items:
-            item.set_animation_active(active)
 
     def populate(self, coords_2d: np.ndarray, labels: np.ndarray, colors: List[str]) -> None:
-        """Populate the scatter scene with points."""
+        """Populate the scatter scene with points.
+
+        Parameters
+        ----------
+        coords_2d : np.ndarray
+            2D coordinates from PCA transformation.
+        labels : np.ndarray
+            Cluster labels for each point.
+        colors : List[str]
+            Colour palette for clusters.
+        """
+        # Clear any existing items before populating new scatter points
         scene = self.scene()
         scene.clear()
-        self._scatter_items.clear()
-
-        if coords_2d is None or labels is None or len(coords_2d) == 0:
+        self._scatter_items = []
+        # Store labels and convert provided colours to QColours
+        self.labels = labels.astype(int)
+        self.cluster_colors = [_hsl_to_qcolor(c) for c in colors]
+        # Debug: log basic statistics about the embedding
+        print(f"DEBUG: Populating scatter with {coords_2d.shape[0]} points")
+        # Normalize coordinates to view range
+        if coords_2d.size == 0:
             return
-
-        self.labels = labels
-        self.cluster_colors = [
-            _hsl_to_qcolor(color) if isinstance(color, str) else color for color in colors
-        ]
-
-        # Normalize coords into scene size
-        coords = normalize_to_scene(coords_2d, width=400, height=400, padding=20)
-
-        for idx, (x, y) in enumerate(coords):
-            cluster = int(labels[idx])
-            color = self.cluster_colors[cluster] if cluster < len(self.cluster_colors) else QColor("red")
-            item = ScatterGraphicsItem(idx, x, y, radius=2.5, color=color)
+        xs = coords_2d[:, 0]
+        ys = coords_2d[:, 1]
+        min_x, max_x = xs.min(), xs.max()
+        min_y, max_y = ys.min(), ys.max()
+        # Add margin
+        padding = 20
+        width = max_x - min_x
+        height = max_y - min_y
+        for i, (x, y) in enumerate(coords_2d):
+            # Map to scene coordinates
+            sx = (x - min_x) / (width + 1e-9) * 400 + padding
+            sy = (y - min_y) / (height + 1e-9) * 400 + padding
+            lbl = int(labels[i])
+            col = self.cluster_colors[lbl] if lbl < len(self.cluster_colors) else QColor('black')
+            # Create a scatter item for this point and connect signals
+            item = ScatterGraphicsItem(i, sx, sy, radius=4.0, color=col)
             item.clicked.connect(self._on_item_clicked)
             item.hovered.connect(self._on_item_hovered)
             scene.addItem(item)
             self._scatter_items.append(item)
-
-        padding = 20
-        scene.setSceneRect(0, 0, 400 + 2 * padding, 400 + 2 * padding)
+        scene.setSceneRect(0, 0, 400 + 2*padding, 400 + 2*padding)
         self.fitInView(scene.sceneRect(), Qt.KeepAspectRatio)
+
+    def _on_item_clicked(self, index: int) -> None:
+        """Emit signal with the cluster of the clicked point."""
+        print(f"DEBUG: Scatter point clicked at index {index}")
+        if self.labels is None:
+            return
+        cluster = int(self.labels[index])
+        self.cluster_selected.emit(cluster)
+
+    def _on_item_hovered(self, index: int, state: bool) -> None:
+        """Forward hover state to external listeners."""
+        print(f"DEBUG: Scatter point hover state changed for index {index}, state={state}")
+        self.point_hovered.emit(index, state)
 
     def set_point_opacity(self, index: int, on: bool) -> None:
         """Manually adjust opacity of a scatter point."""
         if 0 <= index < len(self._scatter_items):
             target_opacity = 1.0 if on else 0.6
+            print(f"DEBUG: Setting scatter point {index} opacity to {target_opacity}")
             self._scatter_items[index].setOpacity(target_opacity)
 
-    def _on_item_clicked(self, idx: int, ctrl: bool) -> None:
-        """Handle scatter point click and emit cluster selection."""
-        if self._suppress_clicks:
-            return
-        if self.labels is None or idx < 0 or idx >= len(self.labels):
-            return
-        cluster = int(self.labels[idx])
-        self.cluster_selected.emit(cluster, ctrl)
-
-    def _on_item_hovered(self, idx: int, state: bool) -> None:
-        """Handle scatter point hover and emit point hover signal."""
-        self.point_hovered.emit(idx, state)
-
-    def _forward_drag_event(self, event: QMouseEvent, button: Qt.MouseButton) -> None:
-        """Forward a synthetic mouse event to Qt for native drag handling."""
-        from PySide6.QtCore import QEvent
-        from PySide6.QtGui import QMouseEvent
-        synthetic = QMouseEvent(
-            event.type(),
-            event.position(),
-            event.globalPosition(),
-            button,
-            button | event.buttons(),
-            event.modifiers(),
-        )
-        if event.type() == QEvent.Type.MouseButtonPress:
-            super().mousePressEvent(synthetic)
-        elif event.type() == QEvent.Type.MouseMove:
-            super().mouseMoveEvent(synthetic)
-        elif event.type() == QEvent.Type.MouseButtonRelease:
-            super().mouseReleaseEvent(synthetic)
-
-    def mouseMoveEvent(self, event) -> None:
-        """Handle mouse move for hover only; panning is handled by Qt natively."""
-        # Ignore move events during Qt-native panning
-        if self._was_panning and (event.buttons() & Qt.MouseButton.MiddleButton):
-            self._forward_drag_event(event, Qt.MouseButton.LeftButton)
-            return  # Let Qt handle panning natively
+    def set_animation_active(self, active: bool) -> None:
+        """Set whether a cascade animation is in progress.
         
-        # If not panning, call base class for hover detection
-        super().mouseMoveEvent(event)
-    
-    def mousePressEvent(self, event) -> None:
-        """Handle mouse press for native panning with middle button."""
-        if event.button() == Qt.MouseButton.MiddleButton:
-            print("DEBUG: Scatter view middle mouse button pressed for native panning")
-            self.setDragMode(QGraphicsView.DragMode.ScrollHandDrag)
-            self.setCursor(Qt.CursorShape.OpenHandCursor)
-            self._was_panning = True
-            self._suppress_clicks = True
-        # Forward as left button press to trigger Qt's native drag
-            self._forward_drag_event(event, Qt.MouseButton.LeftButton)
-            return
-        super().mousePressEvent(event)
-
-    def mouseReleaseEvent(self, event) -> None:
-        """Restore state after Qt-native panning or forward to base class."""
-        if self._was_panning and event.button() == Qt.MouseButton.MiddleButton:
-            print("DEBUG: Scatter view middle mouse button released; ending native panning")
-            # Forward as left button release to complete Qt's native drag
-            self._forward_drag_event(event, Qt.MouseButton.LeftButton)
-            self.setDragMode(QGraphicsView.DragMode.NoDrag)
-            self.setCursor(Qt.CursorShape.CrossCursor)
-            self._was_panning = False
-            self._suppress_clicks = False
-            return
-        super().mouseReleaseEvent(event)
+        When active, scatter items will skip hover opacity changes to
+        avoid interfering with the synchronized cascade animation.
+        
+        Parameters
+        ----------
+        active : bool
+            True if cascade animation is in progress, False otherwise.
+        """
+        self._animation_active = active
+        # Propagate to all scatter items
+        for item in self._scatter_items:
+            item.set_animation_active(active)
 
     def wheelEvent(self, event) -> None:
         """Zoom in/out with mouse wheel."""
+        # Determine zoom factor based on scroll direction
         factor = 1.2 if event.angleDelta().y() > 0 else 0.8
+        print(f"DEBUG: Scatter view zoom with factor {factor}")
         self.scale(factor, factor)
         event.accept()
 

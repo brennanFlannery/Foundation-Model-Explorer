@@ -393,3 +393,50 @@ def scale_coords_to_thumbnail(coords: np.ndarray, slide_dims: Tuple[int, int],
     scaled[:, 0] = coords[:, 0] * sx
     scaled[:, 1] = coords[:, 1] * sy
     return scaled
+
+
+def get_slide_dimensions(image_path: str) -> Optional[Tuple[int, int]]:
+    """Get the full resolution dimensions of a whole-slide image.
+    
+    Parameters
+    ----------
+    image_path : str
+        Path to the whole-slide image file.
+        
+    Returns
+    -------
+    Optional[Tuple[int, int]]
+        Tuple of (width, height) in level-0 pixels, or None if dimensions
+        cannot be determined.
+        
+    Notes
+    -----
+    Uses OpenSlide if available, otherwise falls back to PIL.
+    """
+    if openslide is not None:
+        try:
+            slide = openslide.OpenSlide(image_path)
+            dims = slide.dimensions
+            slide.close()
+            return dims
+        except Exception as e:
+            print(f"Debug: OpenSlide failed to get dimensions: {e}")
+    
+    # Fallback to PIL
+    try:
+        with Image.open(image_path) as img:
+            return img.size
+    except Exception as e:
+        print(f"Debug: PIL failed to get dimensions: {e}")
+        return None
+
+
+def is_openslide_available() -> bool:
+    """Check if OpenSlide is available for adaptive zoom.
+    
+    Returns
+    -------
+    bool
+        True if OpenSlide is installed and importable.
+    """
+    return openslide is not None

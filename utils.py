@@ -154,6 +154,37 @@ def infer_slide_dims(coords: np.ndarray, patch_size_lv0: int) -> Tuple[int, int]
     return (width, height)
 
 
+def normalize_to_scene(coords: np.ndarray, width: int, height: int, padding: int) -> np.ndarray:
+    """Normalize 2D coordinates to a fixed scene size.
+
+    Parameters
+    ----------
+    coords : np.ndarray
+        Array of shape `(n_points, 2)` with source coordinates.
+    width : int
+        Target scene width in pixels.
+    height : int
+        Target scene height in pixels.
+    padding : int
+        Padding applied on all sides.
+
+    Returns
+    -------
+    np.ndarray
+        Normalized coordinates of shape `(n_points, 2)`.
+    """
+    if coords.size == 0:
+        return np.zeros((0, 2))
+    x_min, y_min = coords.min(axis=0)
+    x_max, y_max = coords.max(axis=0)
+    x_range = max(float(x_max - x_min), 1e-9)
+    y_range = max(float(y_max - y_min), 1e-9)
+    scale = min((width - 2 * padding) / x_range, (height - 2 * padding) / y_range)
+    x = (coords[:, 0] - x_min) * scale + padding
+    y = (coords[:, 1] - y_min) * scale + padding
+    return np.column_stack((x, y))
+
+
 def radial_sweep_order(coords: np.ndarray, click_point: Tuple[float, float]) -> np.ndarray:
     """Compute indices of patches sorted by distance from a click point.
 

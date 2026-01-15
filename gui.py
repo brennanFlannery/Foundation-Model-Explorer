@@ -75,11 +75,13 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 from shapely.geometry import box
 from shapely.ops import unary_union
-from PySide6.QtCore import Qt, QTimer, QPointF, QObject
-from PySide6.QtGui import QColor, QImage, QPixmap, QPainter
+from PySide6.QtCore import Qt, QTimer, QPointF, QObject, QPoint, QPropertyAnimation, QEasingCurve
+from PySide6.QtGui import QColor, QImage, QPixmap, QPainter, QCursor
 from PySide6.QtWidgets import (
     QApplication,
+    QDockWidget,
     QFileDialog,
+    QFrame,
     QGraphicsItem,
     QGraphicsPixmapItem,
     QGraphicsRectItem,
@@ -91,6 +93,7 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QMessageBox,
     QPushButton,
+    QScrollArea,
     QSpinBox,
     QVBoxLayout,
     QWidget,
@@ -98,6 +101,8 @@ from PySide6.QtWidgets import (
     QGraphicsEllipseItem,
     QCheckBox,
     QProgressBar,
+    QGraphicsDropShadowEffect,
+    QMenu,
 )
 from PySide6.QtGui import QAction
 from PySide6.QtCore import QSettings, QAbstractListModel, QModelIndex
@@ -309,6 +314,672 @@ class ModelMultiSelector(QComboBox):
         """Set tooltip for a specific model item."""
         self._model.setItemToolTip(model_name, tooltip)
 
+
+class PatchInfoPanel(QWidget):
+    """Widget displaying information about hovered/selected patch.
+    
+    This panel shows details about the currently hovered patch, including
+    its index, coordinates, cluster assignment, and distance to the
+    cluster centroid in feature space.
+    
+    Attributes
+    ----------
+    index_label : QLabel
+        Displays the patch index.
+    coords_label : QLabel
+        Displays the patch coordinates.
+    cluster_label : QLabel
+        Displays the cluster assignment.
+    distance_label : QLabel
+        Displays distance to cluster centroid.
+    """
+    
+    def __init__(self, parent: Optional[QWidget] = None):
+        super().__init__(parent)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(4)
+        
+        # Header
+        header = QLabel("Patch Info")
+        header.setStyleSheet("font-weight: bold; font-size: 11pt;")
+        layout.addWidget(header)
+        
+        # Separator line
+        sep = QFrame()
+        sep.setFrameShape(QFrame.HLine)
+        sep.setFrameShadow(QFrame.Sunken)
+        layout.addWidget(sep)
+        
+        # Info labels
+        self.index_label = QLabel("Patch: -")
+        self.index_label.setStyleSheet("font-size: 9pt;")
+        layout.addWidget(self.index_label)
+        
+        self.coords_label = QLabel("Position: -")
+        self.coords_label.setStyleSheet("font-size: 9pt;")
+        layout.addWidget(self.coords_label)
+        
+        self.cluster_label = QLabel("Cluster: -")
+        self.cluster_label.setStyleSheet("font-size: 9pt;")
+        layout.addWidget(self.cluster_label)
+        
+        self.distance_label = QLabel("Centroid dist: -")
+        self.distance_label.setStyleSheet("font-size: 9pt; color: #666;")
+        layout.addWidget(self.distance_label)
+        
+        layout.addStretch()
+        
+        # Set size constraints
+        self.setMinimumWidth(150)
+        self.setMaximumWidth(200)
+    
+    def update_patch_info(self, index: int, coords: Optional[Tuple[float, float]],
+                          cluster: Optional[int], distance: Optional[float]) -> None:
+        """Update displayed patch information.
+        
+        Parameters
+        ----------
+        index : int
+            Patch index, or -1 to clear.
+        coords : Optional[Tuple[float, float]]
+            Patch coordinates (x, y) or None.
+        cluster : Optional[int]
+            Cluster assignment or None.
+        distance : Optional[float]
+            Distance to cluster centroid or None.
+        """
+        if index < 0:
+            self.index_label.setText("Patch: -")
+            self.coords_label.setText("Position: -")
+            self.cluster_label.setText("Cluster: -")
+            self.distance_label.setText("Centroid dist: -")
+        else:
+            self.index_label.setText(f"Patch: {index}")
+            if coords is not None:
+                self.coords_label.setText(f"Position: ({coords[0]:.0f}, {coords[1]:.0f})")
+            else:
+                self.coords_label.setText("Position: -")
+            if cluster is not None:
+                self.cluster_label.setText(f"Cluster: {cluster}")
+            else:
+                self.cluster_label.setText("Cluster: -")
+            if distance is not None:
+                self.distance_label.setText(f"Centroid dist: {distance:.1f}%")
+            else:
+                self.distance_label.setText("Centroid dist: -")
+    
+    def clear(self) -> None:
+        """Clear all displayed information."""
+        self.update_patch_info(-1, None, None, None)
+
+
+class PatchInfoPopup(QWidget):
+    """Translucent popup widget displaying patch information on hover.
+
+    This popup appears near the cursor when hovering over scatter points,
+    showing patch index, coordinates, cluster assignment, and centroid distance.
+
+    The widget uses:
+    - Qt.WindowFlags for frameless, translucent window
+    - QPropertyAnimation for smooth fade in/out
+    - Dynamic positioning to avoid viewport edge clipping
+    """
+
+    def __init__(self, parent: Optional[QWidget] = None):
+        super().__init__(parent)
+
+        # Window flags for translucent, frameless, always-on-top popup
+        self.setWindowFlags(
+            Qt.ToolTip |
+            Qt.FramelessWindowHint |
+            Qt.WindowStaysOnTopHint
+        )
+        self.setAttribute(Qt.WA_TranslucentBackground)
+        self.setAttribute(Qt.WA_ShowWithoutActivating)
+
+        # Setup UI
+        self._setup_ui()
+
+        # Animation for fade in/out
+        self._opacity_animation = QPropertyAnimation(self, b"windowOpacity")
+        self._opacity_animation.setDuration(150)
+        self._opacity_animation.setEasingCurve(QEasingCurve.OutCubic)
+
+        # Hover delay timer (prevents flicker on fast mouse movement)
+        self._show_timer = QTimer(self)
+        self._show_timer.setSingleShot(True)
+        self._show_timer.timeout.connect(self._do_show)
+
+        self._hide_timer = QTimer(self)
+        self._hide_timer.setSingleShot(True)
+        self._hide_timer.timeout.connect(self._do_hide)
+
+        # Pending position for delayed show
+        self._pending_pos: Optional[QPoint] = None
+
+        # Initially hidden
+        self.hide()
+
+    def _setup_ui(self) -> None:
+        """Create the popup layout and labels."""
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+
+        # Container frame for styling
+        self._frame = QFrame(self)
+        self._frame.setObjectName("popupFrame")
+        self._frame.setStyleSheet("""
+            #popupFrame {
+                background-color: rgba(40, 40, 45, 230);
+                border-radius: 8px;
+                border: 1px solid rgba(255, 255, 255, 40);
+            }
+        """)
+
+        frame_layout = QVBoxLayout(self._frame)
+        frame_layout.setContentsMargins(12, 10, 12, 10)
+        frame_layout.setSpacing(4)
+
+        # Header
+        self._header = QLabel("Patch Info")
+        self._header.setStyleSheet("""
+            font-weight: bold;
+            font-size: 10pt;
+            color: rgba(255, 255, 255, 230);
+        """)
+        frame_layout.addWidget(self._header)
+
+        # Info labels
+        label_style = "font-size: 9pt; color: rgba(255, 255, 255, 200);"
+
+        self.index_label = QLabel("Patch: -")
+        self.index_label.setStyleSheet(label_style)
+        frame_layout.addWidget(self.index_label)
+
+        self.coords_label = QLabel("Position: -")
+        self.coords_label.setStyleSheet(label_style)
+        frame_layout.addWidget(self.coords_label)
+
+        self.cluster_label = QLabel("Cluster: -")
+        self.cluster_label.setStyleSheet(label_style)
+        frame_layout.addWidget(self.cluster_label)
+
+        self.distance_label = QLabel("Centroid dist: -")
+        self.distance_label.setStyleSheet(
+            "font-size: 9pt; color: rgba(200, 200, 200, 180);"
+        )
+        frame_layout.addWidget(self.distance_label)
+
+        # Add frame to main layout
+        layout.addWidget(self._frame)
+
+        # Add drop shadow effect
+        shadow = QGraphicsDropShadowEffect(self)
+        shadow.setBlurRadius(15)
+        shadow.setColor(QColor(0, 0, 0, 100))
+        shadow.setOffset(2, 2)
+        self._frame.setGraphicsEffect(shadow)
+
+        # Fixed width for consistent appearance
+        self.setFixedWidth(180)
+
+    def update_info(self, index: int, coords: Optional[Tuple[float, float]],
+                    cluster: Optional[int], distance: Optional[float],
+                    cluster_color: Optional[QColor] = None) -> None:
+        """Update displayed patch information.
+
+        Parameters
+        ----------
+        index : int
+            Patch index.
+        coords : Optional[Tuple[float, float]]
+            Patch coordinates (x, y).
+        cluster : Optional[int]
+            Cluster assignment.
+        distance : Optional[float]
+            Distance to cluster centroid (percentage).
+        cluster_color : Optional[QColor]
+            Cluster color for visual indicator.
+        """
+        self.index_label.setText(f"Patch: {index}")
+
+        if coords is not None:
+            self.coords_label.setText(f"Position: ({coords[0]:.0f}, {coords[1]:.0f})")
+        else:
+            self.coords_label.setText("Position: -")
+
+        if cluster is not None:
+            if cluster_color is not None:
+                rgb = f"rgb({cluster_color.red()}, {cluster_color.green()}, {cluster_color.blue()})"
+                self.cluster_label.setText(f"Cluster: {cluster}")
+                self.cluster_label.setStyleSheet(
+                    f"font-size: 9pt; color: {rgb}; font-weight: bold;"
+                )
+            else:
+                self.cluster_label.setText(f"Cluster: {cluster}")
+                self.cluster_label.setStyleSheet("font-size: 9pt; color: rgba(255, 255, 255, 200);")
+        else:
+            self.cluster_label.setText("Cluster: -")
+            self.cluster_label.setStyleSheet("font-size: 9pt; color: rgba(255, 255, 255, 200);")
+
+        if distance is not None:
+            self.distance_label.setText(f"Centroid dist: {distance:.1f}%")
+        else:
+            self.distance_label.setText("Centroid dist: -")
+
+    def show_at_cursor(self, global_pos: QPoint, delay_ms: int = 100) -> None:
+        """Show the popup near the given global position with optional delay.
+
+        Parameters
+        ----------
+        global_pos : QPoint
+            Global screen position (typically from QCursor.pos()).
+        delay_ms : int
+            Delay before showing (prevents flicker on fast movement).
+        """
+        # Cancel any pending hide
+        self._hide_timer.stop()
+
+        # Store position for delayed show
+        self._pending_pos = global_pos
+
+        if delay_ms > 0:
+            self._show_timer.start(delay_ms)
+        else:
+            self._do_show()
+
+    def show_at_position(self, global_pos: QPoint, delay_ms: int = 100) -> None:
+        """Show the popup at a specific position without edge avoidance.
+
+        Parameters
+        ----------
+        global_pos : QPoint
+            Global screen position to place the popup.
+        delay_ms : int
+            Delay before showing (prevents flicker on fast movement).
+        """
+        # Cancel any pending hide
+        self._hide_timer.stop()
+
+        # Store position for delayed show (use directly, no edge calc)
+        self._pending_pos = global_pos
+        self._use_direct_position = True
+
+        if delay_ms > 0:
+            self._show_timer.start(delay_ms)
+        else:
+            self._do_show()
+
+    def _do_show(self) -> None:
+        """Internal method to actually show the popup."""
+        if self._pending_pos is None:
+            return
+
+        # Calculate position with edge avoidance, or use direct position
+        if getattr(self, '_use_direct_position', False):
+            pos = self._pending_pos
+            self._use_direct_position = False
+        else:
+            pos = self._calculate_position(self._pending_pos)
+        self.move(pos)
+
+        # Fade in
+        self._opacity_animation.stop()
+        self._opacity_animation.setStartValue(self.windowOpacity())
+        self._opacity_animation.setEndValue(1.0)
+        self._opacity_animation.start()
+
+        self.show()
+        self.raise_()
+
+    def hide_popup(self, delay_ms: int = 50) -> None:
+        """Hide the popup with optional delay and fade out.
+
+        Parameters
+        ----------
+        delay_ms : int
+            Delay before hiding (allows re-hover to cancel hide).
+        """
+        # Cancel any pending show
+        self._show_timer.stop()
+
+        if delay_ms > 0:
+            self._hide_timer.start(delay_ms)
+        else:
+            self._do_hide()
+
+    def _do_hide(self) -> None:
+        """Internal method to actually hide the popup."""
+        # Fade out then hide
+        self._opacity_animation.stop()
+        self._opacity_animation.setStartValue(self.windowOpacity())
+        self._opacity_animation.setEndValue(0.0)
+
+        # Disconnect any previous connection to avoid duplicates
+        try:
+            self._opacity_animation.finished.disconnect(self._on_fade_out_finished)
+        except RuntimeError:
+            pass
+
+        self._opacity_animation.finished.connect(self._on_fade_out_finished)
+        self._opacity_animation.start()
+
+    def _on_fade_out_finished(self) -> None:
+        """Called when fade-out animation completes."""
+        try:
+            self._opacity_animation.finished.disconnect(self._on_fade_out_finished)
+        except RuntimeError:
+            pass
+        if self.windowOpacity() == 0.0:
+            self.hide()
+
+    def _calculate_position(self, cursor_pos: QPoint) -> QPoint:
+        """Calculate popup position avoiding screen edges.
+
+        Parameters
+        ----------
+        cursor_pos : QPoint
+            Global cursor position.
+
+        Returns
+        -------
+        QPoint
+            Adjusted position for the popup.
+        """
+        # Offset from cursor
+        offset_x = 15
+        offset_y = 15
+
+        # Get screen geometry
+        screen = QApplication.screenAt(cursor_pos)
+        if screen is None:
+            screen = QApplication.primaryScreen()
+        screen_rect = screen.availableGeometry()
+
+        # Calculate popup dimensions
+        popup_width = self.sizeHint().width()
+        popup_height = self.sizeHint().height()
+
+        # Default position: right and below cursor
+        x = cursor_pos.x() + offset_x
+        y = cursor_pos.y() + offset_y
+
+        # Check right edge
+        if x + popup_width > screen_rect.right():
+            x = cursor_pos.x() - popup_width - offset_x
+
+        # Check bottom edge
+        if y + popup_height > screen_rect.bottom():
+            y = cursor_pos.y() - popup_height - offset_y
+
+        # Ensure not off left/top edges
+        x = max(x, screen_rect.left())
+        y = max(y, screen_rect.top())
+
+        return QPoint(x, y)
+
+
+class ClusterLegendWidget(QWidget):
+    """Widget displaying cluster color legend with patch counts.
+
+    This widget shows a vertical list of cluster entries, each containing
+    a colored square, cluster ID, and patch count. The legend automatically
+    updates when clustering changes.
+
+    Attributes
+    ----------
+    _cluster_rows : List[QWidget]
+        List of row widgets for each cluster entry.
+    """
+
+    # Signals for cluster interactions
+    cluster_clicked = Signal(int, bool)       # Emits cluster ID and ctrl state on left-click
+    cluster_toggled = Signal(int, bool)       # Emits cluster ID and checked state
+    cluster_rename = Signal(int)              # Emits cluster ID for rename request
+    cluster_export = Signal(int)              # Emits cluster ID for single export
+    export_all_requested = Signal()           # Emits when "Export All" selected
+
+    def __init__(self, parent: Optional[QWidget] = None):
+        super().__init__(parent)
+        self._layout = QVBoxLayout(self)
+        self._layout.setContentsMargins(8, 8, 8, 8)
+        self._layout.setSpacing(4)
+
+        # Header
+        header = QLabel("Clusters")
+        header.setStyleSheet("font-weight: bold; font-size: 11pt;")
+        self._layout.addWidget(header)
+
+        # Scrollable container for cluster rows
+        self._scroll = QScrollArea()
+        self._scroll.setWidgetResizable(True)
+        self._scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self._scroll.setFrameShape(QFrame.NoFrame)
+
+        self._content = QWidget()
+        self._content_layout = QVBoxLayout(self._content)
+        self._content_layout.setContentsMargins(0, 0, 0, 0)
+        self._content_layout.setSpacing(2)
+        self._content_layout.addStretch()
+
+        self._scroll.setWidget(self._content)
+        self._layout.addWidget(self._scroll)
+
+        self._cluster_rows: List[QWidget] = []
+        self._cluster_names: Dict[int, str] = {}  # Custom names for clusters
+        self._checkboxes: Dict[int, QCheckBox] = {}
+
+        # Set minimum width
+        self.setMinimumWidth(150)
+        self.setMaximumWidth(200)
+    
+    def update_clusters(self, labels: np.ndarray, colors: List[str]) -> None:
+        """Update legend with current cluster data.
+        
+        Parameters
+        ----------
+        labels : np.ndarray
+            Cluster labels for all patches.
+        colors : List[str]
+            HSL color strings for each cluster.
+        """
+        # Clear existing rows
+        for row in self._cluster_rows:
+            row.deleteLater()
+        self._cluster_rows.clear()
+        self._checkboxes.clear()
+        
+        if labels is None or len(labels) == 0:
+            return
+        
+        # Count patches per cluster
+        unique_labels = np.unique(labels)
+        counts = {lbl: np.sum(labels == lbl) for lbl in unique_labels}
+        
+        # Create row for each cluster
+        for lbl in sorted(unique_labels):
+            lbl = int(lbl)
+            count = counts[lbl]
+            color_str = colors[lbl] if lbl < len(colors) else "hsl(0, 0%, 50%)"
+            
+            row = self._create_cluster_row(lbl, count, color_str)
+            # Insert before the stretch
+            self._content_layout.insertWidget(
+                self._content_layout.count() - 1, row
+            )
+            self._cluster_rows.append(row)
+    
+    def _create_cluster_row(self, cluster_id: int, count: int,
+                            color_str: str) -> QWidget:
+        """Create a single cluster row widget.
+
+        Parameters
+        ----------
+        cluster_id : int
+            The cluster ID/number.
+        count : int
+            Number of patches in this cluster.
+        color_str : str
+            HSL color string for the cluster.
+
+        Returns
+        -------
+        QWidget
+            The row widget containing color square, label, and count.
+        """
+        row = QWidget()
+        row.setProperty("cluster_id", cluster_id)  # Store cluster ID for event handling
+        row.setCursor(Qt.PointingHandCursor)  # Indicate clickable
+        row.installEventFilter(self)  # Handle mouse events
+
+        layout = QHBoxLayout(row)
+        layout.setContentsMargins(2, 2, 2, 2)
+        layout.setSpacing(6)
+
+        # Color square
+        color_square = QFrame()
+        color_square.setFixedSize(14, 14)
+        # Convert HSL to hex for CSS
+        qcolor = self._hsl_to_qcolor(color_str)
+        hex_color = qcolor.name()
+        color_square.setStyleSheet(
+            f"background-color: {hex_color}; "
+            f"border: 1px solid #666; border-radius: 2px;"
+        )
+        layout.addWidget(color_square)
+
+        # Checkbox for multi-select
+        checkbox = QCheckBox()
+        checkbox.setToolTip("Select cluster")
+        checkbox.toggled.connect(lambda checked, cid=cluster_id: self.cluster_toggled.emit(cid, checked))
+        layout.addWidget(checkbox)
+        self._checkboxes[cluster_id] = checkbox
+
+        # Cluster label - use custom name if available
+        display_name = self._cluster_names.get(cluster_id, f"Cluster {cluster_id}")
+        label = QLabel(display_name)
+        label.setStyleSheet("font-size: 9pt;")
+        label.setObjectName("cluster_label")  # For later reference when renaming
+        layout.addWidget(label)
+
+        # Spacer
+        layout.addStretch()
+
+        # Count
+        count_label = QLabel(f"({count:,})")
+        count_label.setStyleSheet("color: #888; font-size: 9pt;")
+        layout.addWidget(count_label)
+
+        return row
+
+    def eventFilter(self, obj: QObject, event) -> bool:
+        """Handle mouse events on cluster rows."""
+        from PySide6.QtCore import QEvent
+        from PySide6.QtGui import QMouseEvent
+
+        if event.type() == QEvent.MouseButtonPress:
+            cluster_id = obj.property("cluster_id")
+            if cluster_id is not None:
+                if event.button() == Qt.LeftButton:
+                    ctrl_pressed = bool(event.modifiers() & Qt.ControlModifier)
+                    self.cluster_clicked.emit(cluster_id, ctrl_pressed)
+                    return True
+                elif event.button() == Qt.RightButton:
+                    self._show_context_menu(cluster_id, event.globalPos())
+                    return True
+        return super().eventFilter(obj, event)
+
+    def _show_context_menu(self, cluster_id: int, pos) -> None:
+        """Show context menu for a cluster row."""
+        menu = QMenu(self)
+
+        # Rename action
+        rename_action = menu.addAction("Rename Cluster...")
+        rename_action.triggered.connect(lambda: self.cluster_rename.emit(cluster_id))
+
+        # Export single cluster
+        export_action = menu.addAction("Export as GeoJSON...")
+        export_action.triggered.connect(lambda: self.cluster_export.emit(cluster_id))
+
+        menu.addSeparator()
+
+        # Export all clusters
+        export_all_action = menu.addAction("Export All Clusters...")
+        export_all_action.triggered.connect(self.export_all_requested.emit)
+
+        menu.exec_(pos)
+
+    def set_cluster_checked(self, cluster_id: int, checked: bool,
+                            block_signals: bool = True) -> None:
+        """Set checkbox state for a cluster row."""
+        checkbox = self._checkboxes.get(cluster_id)
+        if checkbox is None:
+            return
+        if block_signals:
+            checkbox.blockSignals(True)
+        checkbox.setChecked(checked)
+        if block_signals:
+            checkbox.blockSignals(False)
+
+    def set_cluster_name(self, cluster_id: int, name: str) -> None:
+        """Set a custom name for a cluster.
+
+        Parameters
+        ----------
+        cluster_id : int
+            The cluster ID to rename.
+        name : str
+            The new display name.
+        """
+        self._cluster_names[cluster_id] = name
+
+    def get_cluster_name(self, cluster_id: int) -> str:
+        """Get the display name for a cluster.
+
+        Parameters
+        ----------
+        cluster_id : int
+            The cluster ID.
+
+        Returns
+        -------
+        str
+            Custom name if set, otherwise default "Cluster N" format.
+        """
+        return self._cluster_names.get(cluster_id, f"Cluster {cluster_id}")
+
+    def clear_cluster_names(self) -> None:
+        """Clear all custom cluster names."""
+        self._cluster_names.clear()
+    
+    @staticmethod
+    def _hsl_to_qcolor(hsl_string: str) -> QColor:
+        """Convert HSL string to QColor.
+        
+        Parameters
+        ----------
+        hsl_string : str
+            Color in format 'hsl(H, S%, L%)'.
+            
+        Returns
+        -------
+        QColor
+            Converted Qt color object.
+        """
+        try:
+            values = hsl_string.strip().lower().replace('hsl(', '').rstrip(')').split(',')
+            h = float(values[0])
+            s = float(values[1].strip(' %')) / 100.0
+            l = float(values[2].strip(' %')) / 100.0
+            c = QColor()
+            c.setHslF(h / 360.0, s, l)
+            return c
+        except Exception:
+            return QColor('black')
+
+
 class MainWindow(QMainWindow):
     """Main application window for FoundationDetector.
     
@@ -350,8 +1021,8 @@ class MainWindow(QMainWindow):
         Patch size at full resolution (level-0) for GeoJSON export.
     _coord_scale_factor : Optional[float]
         Scale factor from thumbnail to level-0 coordinates (slide_w / thumb_w).
-    _active_cluster : Optional[int]
-        Currently selected cluster number, used for persistent opacity styling.
+    _selected_clusters : set[int]
+        Currently selected clusters, used for persistent opacity styling.
     
     Methods
     -------
@@ -400,12 +1071,16 @@ class MainWindow(QMainWindow):
         self._hover_prev_brush = None
         # Track currently hovered scatter index when hovering slide patches
         self._hovered_scatter_idx: Optional[int] = None
-        # Track active cluster for persistent opacity reduction
-        self._active_cluster: Optional[int] = None
+        # Track selected clusters for persistent opacity reduction
+        self._selected_clusters: set[int] = set()
         # Store level-0 coordinates for GeoJSON export
         self._current_coords_lv0: Optional[np.ndarray] = None
         self._current_patch_size_lv0: Optional[float] = None
         self._coord_scale_factor: Optional[float] = None
+        # Store cluster centroids for distance calculations
+        self._cluster_centroids: Optional[np.ndarray] = None
+        self._max_cluster_distances: Optional[np.ndarray] = None
+        self._current_labels: Optional[np.ndarray] = None
         # Track cascade animation state to prevent hover interference
         self._animation_in_progress: bool = False
 
@@ -464,31 +1139,83 @@ class MainWindow(QMainWindow):
         self.status_label.setStyleSheet("color: gray; font-size: 9pt;")
         self.status_label.setWordWrap(True)
         main_vbox.addWidget(self.status_label)
-        # Create horizontal layout for the two panels
-        panels_layout = QHBoxLayout()
-        # Left panel: Slide view
+        
+        # Horizontal layout for legend + info panel + slide view
+        content_layout = QHBoxLayout()
+        
+        # Left sidebar: cluster legend + patch info panel
+        left_sidebar = QVBoxLayout()
+        
+        # Cluster legend widget
+        self.cluster_legend = ClusterLegendWidget()
+        left_sidebar.addWidget(self.cluster_legend)
+        # Connect legend signals
+        self.cluster_legend.cluster_clicked.connect(self._on_legend_cluster_clicked)
+        self.cluster_legend.cluster_toggled.connect(self._on_legend_cluster_toggled)
+        self.cluster_legend.cluster_rename.connect(self._on_rename_cluster)
+        self.cluster_legend.cluster_export.connect(self._on_export_single_cluster)
+        self.cluster_legend.export_all_requested.connect(self._on_export_all_clusters)
+
+        left_sidebar.addStretch()
+        content_layout.addLayout(left_sidebar)
+        
+        # Main slide view (takes remaining width)
         self.graphics_view = SlideGraphicsView()
         self.graphics_view.setMinimumWidth(400)
         # Connect signals: slide click selects cluster and updates scatter
         self.graphics_view.cluster_selected.connect(
-            lambda cluster, pos: self._update_scatter_for_cluster(cluster, pos)
+            lambda cluster, pos, ctrl: self._update_scatter_for_cluster(cluster, pos, ctrl)
         )
         # Connect slide hover to scatter
         self.graphics_view.patch_hovered.connect(self._on_slide_patch_hovered)
         # Connect slide animation signals for synchronized scatter cascade
         self.graphics_view.patches_highlighted.connect(self._on_patches_highlighted)
         self.graphics_view.animation_completed.connect(self._on_animation_completed)
-        panels_layout.addWidget(self.graphics_view, stretch=1)
-        # Right panel: Scatter plot view
+        content_layout.addWidget(self.graphics_view, stretch=1)
+        
+        main_vbox.addLayout(content_layout, stretch=1)
+        
+        # Scatter plot view in floating dock widget
         self.scatter_view = ScatterGraphicsView()
-        self.scatter_view.setMinimumWidth(300)
+        self.scatter_view.setMinimumSize(250, 250)
         # Connect scatter click to highlight slide
         self.scatter_view.cluster_selected.connect(self._on_scatter_cluster_selected)
         # Connect scatter hover to highlight slide and scatter
         self.scatter_view.point_hovered.connect(self._on_scatter_point_hovered)
-        panels_layout.addWidget(self.scatter_view, stretch=1)
-        # Add panels layout
-        main_vbox.addLayout(panels_layout)
+        
+        # Create dock widget for scatter view
+        self.scatter_dock = QDockWidget("Embedding View", self)
+        self.scatter_dock.setWidget(self.scatter_view)
+        self.scatter_dock.setAllowedAreas(Qt.AllDockWidgetAreas)
+        self.scatter_dock.setFeatures(
+            QDockWidget.DockWidgetMovable | 
+            QDockWidget.DockWidgetFloatable |
+            QDockWidget.DockWidgetClosable
+        )
+        # Add to main window and set floating
+        self.addDockWidget(Qt.RightDockWidgetArea, self.scatter_dock)
+        self.scatter_dock.setFloating(True)
+        self.scatter_dock.resize(350, 350)
+        
+        # Add scatter dock toggle to View menu (after dock is created)
+        self._view_menu.addSeparator()
+        self.scatter_dock_action = self.scatter_dock.toggleViewAction()
+        self.scatter_dock_action.setText("Show Embedding View")
+        self.scatter_dock_action.setShortcut("Ctrl+3")
+        self._view_menu.addAction(self.scatter_dock_action)
+        
+        # Track if scatter dock has been positioned
+        self._scatter_positioned = False
+        
+        # Connect dock visibility changed signal for snapping
+        self.scatter_dock.visibilityChanged.connect(self._on_scatter_dock_visibility_changed)
+
+        # Hover popup for scatter patch info
+        self.patch_info_popup = PatchInfoPopup()
+
+        # Hover popup for slide view patch info (bottom-left corner)
+        self.slide_info_popup = PatchInfoPopup()
+
         # Set starting size
         self.resize(1200, 800)
 
@@ -538,6 +1265,23 @@ class MainWindow(QMainWindow):
         self.overlay_action.setChecked(True)
         self.overlay_action.triggered.connect(self._on_overlay_toggled)
         view_menu.addAction(self.overlay_action)
+        
+        view_menu.addSeparator()
+        
+        # Adaptive Zoom toggle
+        self.adaptive_zoom_action = QAction("Adaptive Zoom (Multi-Resolution)", self)
+        self.adaptive_zoom_action.setShortcut("Ctrl+2")
+        self.adaptive_zoom_action.setCheckable(True)
+        self.adaptive_zoom_action.setChecked(True)  # Default on
+        self.adaptive_zoom_action.setToolTip(
+            "Enable multi-resolution tile loading for high-quality zoom. "
+            "Disable for faster loading with fixed-resolution thumbnail."
+        )
+        self.adaptive_zoom_action.triggered.connect(self._on_adaptive_zoom_toggled)
+        view_menu.addAction(self.adaptive_zoom_action)
+        
+        # Store view_menu reference for adding scatter dock toggle later
+        self._view_menu = view_menu
         
         # Help Menu
         help_menu = self.menuBar().addMenu("&Help")
@@ -708,6 +1452,14 @@ class MainWindow(QMainWindow):
         # Adjust visibility of patch rects
         for rect in getattr(self.graphics_view, 'rect_items', []):
             rect.setVisible(checked)
+    
+    def _on_adaptive_zoom_toggled(self, checked: bool) -> None:
+        """Toggle adaptive zoom mode and reload the current slide."""
+        print(f"DEBUG: Adaptive zoom toggled; enabled={checked}")
+        self.graphics_view.set_adaptive_mode(checked)
+        # Reload the current slide in the new mode
+        if self.slide_combo.currentText():
+            self._load_current_data()
 
     def _on_slide_patch_hovered(self, idx: int, state: bool) -> None:
         """Highlight the scatter point corresponding to the hovered slide patch."""
@@ -718,20 +1470,22 @@ class MainWindow(QMainWindow):
             return
         # When hover leaves or invalid index
         if idx == -1 or not state:
+            # Hide slide popup
+            self.slide_info_popup.hide_popup()
             # Clear hover state in scatter
             if self._hovered_scatter_idx is not None:
                 print(f"DEBUG: Slide hover leave for scatter index {self._hovered_scatter_idx}")
-            # If no active cluster, reset all to default opacity
-            if self._active_cluster is None:
+            # If no selected clusters, reset all to default opacity
+            if not self._selected_clusters:
                 if self.scatter_view.labels is None:
                     return
-                print("DEBUG: No active cluster; resetting scatter opacities to default")
+                print("DEBUG: No selected clusters; resetting scatter opacities to default")
                 for item in self.scatter_view._scatter_items:
                     item.setOpacity(0.6)
             else:
-                # Apply persistent opacity reduction for active cluster
-                print(f"DEBUG: Maintaining active cluster {self._active_cluster} opacities on hover leave")
-                self._apply_active_cluster_styles()
+                # Apply persistent opacity reduction for selected clusters
+                print("DEBUG: Maintaining selected cluster opacities on hover leave")
+                self._apply_selected_cluster_styles()
             self._hovered_scatter_idx = None
         else:
             # Hover over a valid patch
@@ -739,9 +1493,9 @@ class MainWindow(QMainWindow):
             if self._hovered_scatter_idx is not None and self._hovered_scatter_idx != idx:
                 prev_idx = self._hovered_scatter_idx
                 # Determine the correct baseline opacity for the previous point
-                if self._active_cluster is not None and self.scatter_view.labels is not None:
+                if self._selected_clusters and self.scatter_view.labels is not None:
                     prev_label = int(self.scatter_view.labels[prev_idx])
-                    if prev_label == self._active_cluster:
+                    if prev_label in self._selected_clusters:
                         # Previous point is in selected cluster → high opacity
                         self.scatter_view._scatter_items[prev_idx].setOpacity(1.0)
                     else:
@@ -756,7 +1510,9 @@ class MainWindow(QMainWindow):
             print(f"DEBUG: Slide hover over patch {idx}; setting scatter point opacity to high")
             self.scatter_view.set_point_opacity(idx, True)
 
-    
+            # Show slide popup in bottom-left corner
+            self._update_and_show_slide_popup(idx)
+
     def _on_scatter_point_hovered(self, idx: int, state: bool) -> None:
         """Highlight the slide patch corresponding to hovered scatter point.
         Red hover overlay is temporary and restores on leave."""
@@ -774,19 +1530,21 @@ class MainWindow(QMainWindow):
 
         if not state or idx < 0 or idx >= len(self.graphics_view.rect_items):
             _clear_previous_hover()
+            # Hide popup
+            self.patch_info_popup.hide_popup()
             # Skip scatter opacity changes if animation is in progress
             # to avoid interrupting the cascade effect
             if self._animation_in_progress:
                 return
-            # Restore scatter opacities based on whether a cluster is active
-            if self._active_cluster is None:
+            # Restore scatter opacities based on whether clusters are selected
+            if not self._selected_clusters:
                 # No active selection: return all points to medium opacity
                 if self.scatter_view and self.scatter_view._scatter_items:
                     for item in self.scatter_view._scatter_items:
                         item.setOpacity(0.6)
             else:
                 # Active selection persists low/high styling
-                self._apply_active_cluster_styles()
+                self._apply_selected_cluster_styles()
             return
 
         # If we are switching items, clear the previous one
@@ -813,35 +1571,174 @@ class MainWindow(QMainWindow):
         rect.setOpacity(0.9)
         self._hovered_slide_rect_idx = idx
 
-    def _on_scatter_cluster_selected(self, cluster: int) -> None:
+        # Show popup with patch info
+        self._update_and_show_popup(idx)
+
+    def _on_scatter_cluster_selected(self, cluster: int, ctrl_pressed: bool) -> None:
         """Respond to cluster selection on scatter plot: highlight slide patches."""
         print(f"DEBUG: Scatter cluster selected {cluster}")
-        # Set active cluster to maintain opacity reduction
-        self._active_cluster = cluster
-        # Enable export action now that a cluster is selected
-        self.export_action.setEnabled(True)
-        # Mark animation as in progress to prevent hover interference
-        self._animation_in_progress = True
-        self.scatter_view.set_animation_active(True)
-        # Find cluster indices
         if self.graphics_view.labels is None:
             return
+        if ctrl_pressed:
+            if not self._add_selected_cluster(cluster):
+                return
+        else:
+            self._set_selected_clusters({cluster})
+        # Prepare scatter baseline for cascade
+        self._prepare_scatter_for_cascade(cluster)
+        # Use the first patch's center as click point approximate
         cluster_indices = np.where(self.graphics_view.labels == cluster)[0]
         if cluster_indices.size == 0:
             return
-        # Initialize scatter points to low opacity before cascade
-        # The patches_highlighted signal will raise opacity for matching points
-        for item in self.scatter_view._scatter_items:
-            item.setOpacity(0.2)
-        # Use the first patch's center as click point approximate
         idx0 = cluster_indices[0]
         x, y = self.graphics_view.coords[idx0] + self.graphics_view.patch_size / 2.0
-        # Compute radial order and start slide animation
+        self._start_slide_cascade(cluster, (x, y))
+
+    def _on_legend_cluster_clicked(self, cluster: int, ctrl_pressed: bool) -> None:
+        """Handle left-click on cluster in legend - trigger cascade from centroid."""
+        print(f"DEBUG: Legend cluster clicked {cluster}")
+
+        # Validate data is loaded
+        self._animation_in_progress = True
+        self._animation_in_progress = True
+        if self.graphics_view.labels is None or self.graphics_view.coords is None:
+            return
+
         cluster_coords = self.graphics_view.coords[cluster_indices]
-        order_local = radial_sweep_order(cluster_coords, (x, y))
-        order_global = cluster_indices[order_local]
-        self.graphics_view._start_animation(cluster, order_global.tolist())
-        # Scatter animation is now synchronized via patches_highlighted signal
+        centroid_x = cluster_coords[:, 0].mean() + self.graphics_view.patch_size / 2.0
+        centroid_y = cluster_coords[:, 1].mean() + self.graphics_view.patch_size / 2.0
+
+        self._start_slide_cascade(cluster, (centroid_x, centroid_y))
+
+    def _on_legend_cluster_toggled(self, cluster: int, checked: bool) -> None:
+        """Handle checkbox toggle for cluster selection."""
+        if self.graphics_view.labels is None or self.graphics_view.coords is None:
+            return
+        if checked:
+            if not self._add_selected_cluster(cluster):
+                return
+            self._prepare_scatter_for_cascade(cluster)
+            cluster_indices = np.where(self.graphics_view.labels == cluster)[0]
+            if cluster_indices.size == 0:
+                return
+            cluster_coords = self.graphics_view.coords[cluster_indices]
+            centroid_x = cluster_coords[:, 0].mean() + self.graphics_view.patch_size / 2.0
+            centroid_y = cluster_coords[:, 1].mean() + self.graphics_view.patch_size / 2.0
+            self._start_slide_cascade(cluster, (centroid_x, centroid_y))
+        else:
+            if self._remove_selected_cluster(cluster):
+                if not self._animation_in_progress:
+                    self._apply_selected_cluster_styles()
+
+    def _on_rename_cluster(self, cluster: int) -> None:
+        """Handle rename cluster request from legend context menu."""
+        current_name = self.cluster_legend.get_cluster_name(cluster)
+        new_name, ok = QInputDialog.getText(
+            self, "Rename Cluster", "Enter new name:",
+            text=current_name
+        )
+        if ok and new_name.strip():
+            self.cluster_legend.set_cluster_name(cluster, new_name.strip())
+            # Refresh legend display
+            if self._current_labels is not None and self.scatter_view.cluster_colors:
+                self.cluster_legend.update_clusters(
+                    self._current_labels,
+                    [self._qcolor_to_hsl_string(c) for c in self.scatter_view.cluster_colors]
+                )
+
+    def _on_export_single_cluster(self, cluster: int) -> None:
+        """Handle export single cluster request from legend context menu."""
+        self._export_single_cluster(cluster)
+
+    def _on_export_all_clusters(self) -> None:
+        """Export all clusters to a single GeoJSON file."""
+        # Validate data
+        if self._current_labels is None:
+            QMessageBox.warning(self, "Export Error", "No clustering data available.")
+            return
+        if self._current_coords_thumb is None or self._coord_scale_factor is None:
+            QMessageBox.warning(self, "Export Error", "Coordinate data not available.")
+            return
+
+        # Get file path
+        default_name = "all_clusters.geojson"
+        if hasattr(self, '_root_dir') and self._root_dir:
+            default_path = os.path.join(self._root_dir, default_name)
+        else:
+            default_path = default_name
+
+        file_path, _ = QFileDialog.getSaveFileName(
+            self, "Export All Clusters", default_path,
+            "GeoJSON Files (*.geojson);;All Files (*)"
+        )
+        if not file_path:
+            return
+        if not file_path.endswith('.geojson'):
+            file_path += '.geojson'
+
+        # Build features for all clusters
+        features = []
+        unique_clusters = np.unique(self._current_labels)
+
+        for cluster in unique_clusters:
+            cluster = int(cluster)
+            # Merge patches for this cluster
+            merged_coords = self._merge_cluster_patches(cluster)
+            if not merged_coords:
+                continue
+
+            # Get cluster color
+            if cluster < len(self.scatter_view.cluster_colors):
+                color_hsl = self._qcolor_to_hsl_string(self.scatter_view.cluster_colors[cluster])
+                color_rgb = self._hsl_to_qupath_rgb(color_hsl)
+            else:
+                color_rgb = -16776961  # Default blue
+
+            # Get cluster name
+            cluster_name = self.cluster_legend.get_cluster_name(cluster)
+
+            # Create feature for each polygon in merged result
+            for poly_coords in merged_coords:
+                feature = {
+                    "type": "Feature",
+                    "id": str(uuid.uuid4()),
+                    "geometry": {
+                        "type": "Polygon",
+                        "coordinates": poly_coords
+                    },
+                    "properties": {
+                        "objectType": "annotation",
+                        "classification": {
+                            "name": cluster_name,
+                            "colorRGB": color_rgb
+                        },
+                        "isLocked": False,
+                        "measurements": []
+                    }
+                }
+                features.append(feature)
+
+        # Build GeoJSON
+        geojson = {
+            "type": "FeatureCollection",
+            "features": features
+        }
+
+        # Write file
+        try:
+            with open(file_path, 'w') as f:
+                json.dump(geojson, f, indent=2)
+            QMessageBox.information(
+                self, "Export Complete",
+                f"Exported {len(unique_clusters)} clusters ({len(features)} polygons) to:\n{file_path}"
+            )
+        except Exception as e:
+            QMessageBox.critical(self, "Export Error", f"Failed to write file:\n{str(e)}")
+
+    def _qcolor_to_hsl_string(self, color: QColor) -> str:
+        """Convert QColor to HSL string format."""
+        h, s, l, _ = color.getHslF()
+        return f"hsl({int(h * 360)}, {int(s * 100)}%, {int(l * 100)}%)"
 
     def _populate_scatter_scene(self, embedding: np.ndarray, labels: np.ndarray, colours: List[str]) -> None:
         scene = self.scatter_view.scene()
@@ -887,6 +1784,85 @@ class MainWindow(QMainWindow):
         scene.setSceneRect(scene.itemsBoundingRect())
         self.scatter_view.fitInView(scene.sceneRect(), Qt.KeepAspectRatio)
 
+    def _update_and_show_popup(self, index: int) -> None:
+        """Update popup content and show near cursor.
+
+        Parameters
+        ----------
+        index : int
+            Patch index to display info for.
+        """
+        if index < 0:
+            self.patch_info_popup.hide_popup()
+            return
+
+        # Get coordinates
+        coords = None
+        if self._current_coords_lv0 is not None and index < len(self._current_coords_lv0):
+            x, y = self._current_coords_lv0[index]
+            coords = (float(x), float(y))
+
+        # Get cluster label and color
+        cluster = None
+        cluster_color = None
+        if self._current_labels is not None and index < len(self._current_labels):
+            cluster = int(self._current_labels[index])
+            if self.scatter_view and hasattr(self.scatter_view, 'cluster_colors'):
+                if cluster < len(self.scatter_view.cluster_colors):
+                    cluster_color = self.scatter_view.cluster_colors[cluster]
+
+        # Get distance to centroid
+        distance = self._get_distance_to_centroid(index)
+
+        # Update popup content
+        self.patch_info_popup.update_info(index, coords, cluster, distance, cluster_color)
+
+        # Show at current cursor position
+        cursor_pos = QCursor.pos()
+        self.patch_info_popup.show_at_cursor(cursor_pos)
+
+    def _update_and_show_slide_popup(self, index: int) -> None:
+        """Update slide popup content and show in bottom-left corner of slide view.
+
+        Parameters
+        ----------
+        index : int
+            Patch index to display info for.
+        """
+        if index < 0:
+            self.slide_info_popup.hide_popup()
+            return
+
+        # Get coordinates
+        coords = None
+        if self._current_coords_lv0 is not None and index < len(self._current_coords_lv0):
+            x, y = self._current_coords_lv0[index]
+            coords = (float(x), float(y))
+
+        # Get cluster label and color
+        cluster = None
+        cluster_color = None
+        if self._current_labels is not None and index < len(self._current_labels):
+            cluster = int(self._current_labels[index])
+            if self.scatter_view and hasattr(self.scatter_view, 'cluster_colors'):
+                if cluster < len(self.scatter_view.cluster_colors):
+                    cluster_color = self.scatter_view.cluster_colors[cluster]
+
+        # Get distance to centroid
+        distance = self._get_distance_to_centroid(index)
+
+        # Update popup content
+        self.slide_info_popup.update_info(index, coords, cluster, distance, cluster_color)
+
+        # Calculate bottom-left corner position of the graphics view
+        view_rect = self.graphics_view.rect()
+        popup_height = self.slide_info_popup.sizeHint().height()
+        margin = 10
+        bottom_left = self.graphics_view.mapToGlobal(
+            QPoint(margin, view_rect.height() - popup_height - margin)
+        )
+        self.slide_info_popup.show_at_position(bottom_left)
+
     def _highlight_corresponding_items(self, index: int) -> None:
         """Highlight corresponding items in both views.
 
@@ -916,7 +1892,8 @@ class MainWindow(QMainWindow):
         # Update slide view patches
         self.graphics_view._highlight_cluster(label)
 
-    def _update_scatter_for_cluster(self, cluster: int, click_point: Tuple[float, float]) -> None:
+    def _update_scatter_for_cluster(self, cluster: int, click_point: Tuple[float, float],
+                                    ctrl_pressed: bool) -> None:
         """Prepare scatter plot for synchronized cascade animation.
         
         This method sets up the scatter plot's initial state before the slide
@@ -924,21 +1901,44 @@ class MainWindow(QMainWindow):
         patches_highlighted signal from SlideGraphicsView, which ensures both
         views animate in perfect synchronization.
         """
-        if not self.scatter_view._scatter_items or not hasattr(self, '_current_features'):
+        if not hasattr(self, '_current_features'):
             return
         print(f"DEBUG: Preparing scatter for synchronized cascade, cluster {cluster}")
-        # Set active cluster to maintain opacity reduction across panels
-        self._active_cluster = cluster
-        # Enable export action now that a cluster is selected
-        self.export_action.setEnabled(True)
-        # Mark animation as in progress to prevent hover interference
+        if ctrl_pressed:
+            if not self._add_selected_cluster(cluster):
+                return
+        else:
+            self._set_selected_clusters({cluster})
+        self._prepare_scatter_for_cascade(cluster)
+        self._start_slide_cascade(cluster, click_point)
+
+    def _prepare_scatter_for_cascade(self, cluster: int) -> None:
+        """Prepare scatter points for a new cascade animation."""
+        if not self.scatter_view or not self.scatter_view._scatter_items:
+            return
+        if self.scatter_view.labels is None:
+            return
         self._animation_in_progress = True
         self.scatter_view.set_animation_active(True)
+        for i, item in enumerate(self.scatter_view._scatter_items):
+            label = int(self.scatter_view.labels[i])
+            if label in self._selected_clusters and label != cluster:
+                item.setOpacity(1.0)
+            else:
+                item.setOpacity(0.2)
 
-        # Baseline: set all scatter points to low opacity before cascade
-        # The patches_highlighted signal will raise opacity for matching points
-        for item in self.scatter_view._scatter_items:
-            item.setOpacity(0.2)
+    def _start_slide_cascade(self, cluster: int, click_point: Tuple[float, float]) -> None:
+        """Start a slide cascade animation for a cluster."""
+        if self.graphics_view.labels is None or self.graphics_view.coords is None:
+            return
+        cluster_indices = np.where(self.graphics_view.labels == cluster)[0]
+        if cluster_indices.size == 0:
+            return
+        cluster_coords = self.graphics_view.coords[cluster_indices]
+        order_local = radial_sweep_order(cluster_coords, click_point)
+        order_global = cluster_indices[order_local]
+        persisted = set(self._selected_clusters) - {cluster}
+        self.graphics_view._start_animation(cluster, order_global.tolist(), persisted)
 
     def _on_patches_highlighted(self, indices: list) -> None:
         """Synchronize scatter point opacity with slide patch highlights.
@@ -970,7 +1970,7 @@ class MainWindow(QMainWindow):
         # Mark animation as complete
         self._animation_in_progress = False
         self.scatter_view.set_animation_active(False)
-        self._apply_active_cluster_styles()
+        self._apply_selected_cluster_styles()
 
     def _merge_cluster_patches(self, cluster: int) -> List[List]:
         """Merge adjacent patches into continuous polygons.
@@ -1036,62 +2036,140 @@ class MainWindow(QMainWindow):
         return result
 
     def _on_export_clicked(self) -> None:
-        """Handle export button click: prompt for name and save GeoJSON.
-        
-        This method shows dialogs to get the annotation name and save
-        location, then generates a QuPath-compatible GeoJSON file with
-        merged polygon regions for the currently selected cluster.
-        """
-        if self._active_cluster is None:
-            QMessageBox.warning(self, "No Selection", 
-                "Please select a cluster first by clicking on the slide or scatter plot.")
+        """Handle export button click for selected clusters."""
+        if not self._selected_clusters:
+            QMessageBox.warning(
+                self, "No Selection",
+                "Please select a cluster first by clicking on the slide or scatter plot."
+            )
             return
-        
+
         # Check if we have the required coordinate data
         if self._current_coords_thumb is None or self._coord_scale_factor is None:
-            QMessageBox.warning(self, "No Data", 
-                "Please load a slide first.")
+            QMessageBox.warning(self, "No Data", "Please load a slide first.")
             return
-        
-        # Dialog 1: Get annotation name
-        default_name = f"Cluster_{self._active_cluster}"
+
+        selected = sorted(self._selected_clusters)
+        if len(selected) == 1:
+            self._export_single_cluster(selected[0])
+            return
+
+        prompt = QMessageBox(self)
+        prompt.setWindowTitle("Export Selected Clusters")
+        prompt.setText("Export selected clusters as one combined annotation or separate annotations?")
+        combine_button = prompt.addButton("Combine", QMessageBox.AcceptRole)
+        separate_button = prompt.addButton("Separate", QMessageBox.AcceptRole)
+        prompt.addButton(QMessageBox.Cancel)
+        prompt.exec()
+
+        clicked = prompt.clickedButton()
+        if clicked == combine_button:
+            self._export_combined_clusters(selected)
+        elif clicked == separate_button:
+            self._export_separate_clusters(selected)
+
+    def _export_single_cluster(self, cluster: int) -> None:
+        """Export a single cluster to GeoJSON."""
+        if self._current_coords_thumb is None or self._coord_scale_factor is None:
+            QMessageBox.warning(self, "No Data", "Please load a slide first.")
+            return
+
+        default_name = f"Cluster_{cluster}"
         name, ok = QInputDialog.getText(
             self, "Annotation Name",
             "Enter a name for this annotation:",
             text=default_name
         )
         if not ok or not name.strip():
-            return  # User cancelled
-        
+            return
+
         annotation_name = name.strip()
-        
-        # Dialog 2: Get save location
         file_path, _ = QFileDialog.getSaveFileName(
             self, "Save Annotation",
             f"{annotation_name}.geojson",
             "GeoJSON Files (*.geojson);;All Files (*)"
         )
         if not file_path:
-            return  # User cancelled
-        
-        # Ensure .geojson extension
+            return
         if not file_path.lower().endswith('.geojson'):
             file_path += '.geojson'
-        
-        # Generate merged polygons
-        polygons = self._merge_cluster_patches(self._active_cluster)
-        
+
+        polygons = self._merge_cluster_patches(cluster)
         if not polygons:
-            QMessageBox.warning(self, "No Regions",
-                "No patches found for the selected cluster.")
+            QMessageBox.warning(self, "No Regions", "No patches found for the selected cluster.")
             return
-        
-        # Get cluster color for QuPath export
-        colours = generate_palette(int(self.graphics_view.labels.max()) + 1)
-        cluster_color_hsl = colours[self._active_cluster]
-        color_rgb = self._hsl_to_qupath_rgb(cluster_color_hsl)
-        
-        # Build GeoJSON FeatureCollection with QuPath-compatible properties
+
+        color_rgb = self._get_cluster_color_rgb(cluster)
+        features = self._build_geojson_features(polygons, annotation_name, color_rgb)
+        self._write_geojson(file_path, features)
+
+    def _export_combined_clusters(self, clusters: List[int]) -> None:
+        """Export multiple clusters as a single combined annotation."""
+        if self._current_coords_thumb is None or self._coord_scale_factor is None:
+            QMessageBox.warning(self, "No Data", "Please load a slide first.")
+            return
+
+        name, ok = QInputDialog.getText(
+            self, "Annotation Name",
+            "Enter a name for the combined annotation:",
+            text="Combined_Clusters"
+        )
+        if not ok or not name.strip():
+            return
+        annotation_name = name.strip()
+
+        file_path, _ = QFileDialog.getSaveFileName(
+            self, "Save Annotation",
+            f"{annotation_name}.geojson",
+            "GeoJSON Files (*.geojson);;All Files (*)"
+        )
+        if not file_path:
+            return
+        if not file_path.lower().endswith('.geojson'):
+            file_path += '.geojson'
+
+        polygons = self._merge_selected_clusters_patches(clusters)
+        if not polygons:
+            QMessageBox.warning(self, "No Regions", "No patches found for the selected clusters.")
+            return
+
+        color_rgb = self._get_cluster_color_rgb(clusters[0])
+        features = self._build_geojson_features(polygons, annotation_name, color_rgb)
+        self._write_geojson(file_path, features)
+
+    def _export_separate_clusters(self, clusters: List[int]) -> None:
+        """Export multiple clusters to a single GeoJSON file."""
+        if self._current_coords_thumb is None or self._coord_scale_factor is None:
+            QMessageBox.warning(self, "No Data", "Please load a slide first.")
+            return
+
+        file_path, _ = QFileDialog.getSaveFileName(
+            self, "Save Annotation",
+            "selected_clusters.geojson",
+            "GeoJSON Files (*.geojson);;All Files (*)"
+        )
+        if not file_path:
+            return
+        if not file_path.lower().endswith('.geojson'):
+            file_path += '.geojson'
+
+        features = []
+        for cluster in clusters:
+            polygons = self._merge_cluster_patches(cluster)
+            if not polygons:
+                continue
+            cluster_name = self.cluster_legend.get_cluster_name(cluster)
+            color_rgb = self._get_cluster_color_rgb(cluster)
+            features.extend(self._build_geojson_features(polygons, cluster_name, color_rgb))
+
+        if not features:
+            QMessageBox.warning(self, "No Regions", "No patches found for the selected clusters.")
+            return
+
+        self._write_geojson(file_path, features)
+
+    def _build_geojson_features(self, polygons: List[List], name: str, color_rgb: int) -> List[Dict]:
+        """Build GeoJSON features for a set of polygons."""
         features = []
         for coords in polygons:
             feature = {
@@ -1104,7 +2182,7 @@ class MainWindow(QMainWindow):
                 "properties": {
                     "objectType": "annotation",
                     "classification": {
-                        "name": annotation_name,
+                        "name": name,
                         "colorRGB": color_rgb
                     },
                     "isLocked": False,
@@ -1112,24 +2190,72 @@ class MainWindow(QMainWindow):
                 }
             }
             features.append(feature)
-        
+        return features
+
+    def _write_geojson(self, file_path: str, features: List[Dict]) -> None:
+        """Write GeoJSON features to a file."""
         geojson = {
             "type": "FeatureCollection",
             "features": features
         }
-        
-        # Write file
         try:
             with open(file_path, 'w') as f:
                 json.dump(geojson, f, indent=2)
-            
-            QMessageBox.information(self, "Export Complete",
-                f"Exported {len(features)} region(s) to:\n{file_path}")
+            QMessageBox.information(
+                self, "Export Complete",
+                f"Exported {len(features)} region(s) to:\n{file_path}"
+            )
             print(f"DEBUG: Exported GeoJSON with {len(features)} features to {file_path}")
         except Exception as e:
-            QMessageBox.critical(self, "Export Failed",
-                f"Failed to write file:\n{e}")
+            QMessageBox.critical(self, "Export Failed", f"Failed to write file:\n{e}")
             print(f"DEBUG: Export failed: {e}")
+
+    def _get_cluster_color_rgb(self, cluster: int) -> int:
+        """Get QuPath color for a cluster."""
+        if self.scatter_view and hasattr(self.scatter_view, 'cluster_colors'):
+            if cluster < len(self.scatter_view.cluster_colors):
+                color_hsl = self._qcolor_to_hsl_string(self.scatter_view.cluster_colors[cluster])
+                return self._hsl_to_qupath_rgb(color_hsl)
+        colours = generate_palette(int(self.graphics_view.labels.max()) + 1)
+        return self._hsl_to_qupath_rgb(colours[cluster])
+
+    def _merge_selected_clusters_patches(self, clusters: List[int]) -> List[List]:
+        """Merge patches from multiple clusters into polygons."""
+        if self.graphics_view.labels is None:
+            return []
+        if self._current_coords_thumb is None or self._coord_scale_factor is None:
+            return []
+
+        boxes = []
+        for cluster in clusters:
+            indices = np.where(self.graphics_view.labels == cluster)[0]
+            for idx in indices:
+                x, y = self._current_coords_thumb[idx]
+                size = self._current_patch_size_thumb
+                boxes.append(box(x, y, x + size, y + size))
+
+        if not boxes:
+            return []
+
+        merged = unary_union(boxes)
+        scale = self._coord_scale_factor
+
+        if merged.geom_type == 'Polygon':
+            polygons = [merged]
+        elif merged.geom_type == 'MultiPolygon':
+            polygons = list(merged.geoms)
+        else:
+            print(f"DEBUG: Unexpected geometry type from unary_union: {merged.geom_type}")
+            polygons = []
+
+        result = []
+        for poly in polygons:
+            coords = []
+            for ring in [poly.exterior] + list(poly.interiors):
+                scaled_ring = [[int(x * scale), int(y * scale)] for x, y in ring.coords]
+                coords.append(scaled_ring)
+            result.append(coords)
+        return result
 
     def _update_scatter_colours(self, labels: np.ndarray, colours: List[str]) -> None:
         """Update colours of existing scatter points based on new labels.
@@ -1148,32 +2274,76 @@ class MainWindow(QMainWindow):
             item.setBrush(QBrush(color))
 
     # --- persistent cluster styling ---
-    def _apply_active_cluster_styles(self) -> None:
-        """Apply opacity styling to scatter points based on active cluster.
+    def _update_export_action(self) -> None:
+        """Enable or disable export based on selection state."""
+        self.export_action.setEnabled(bool(self._selected_clusters))
 
-        If an active cluster is set, cluster points are shown with high
-        opacity (1.0) and other points with low opacity (0.2).  If no
-        active cluster is set, all points revert to a default opacity
-        (0.6).  This helper does not alter brushes or colours.
-        """
-        # If no scatter points are present, nothing to do
+    def _set_selected_clusters(self, clusters: set[int]) -> None:
+        """Replace selected clusters and sync UI state."""
+        self._selected_clusters = set(clusters)
+        self._sync_legend_checkboxes()
+        self._update_export_action()
+
+    def _add_selected_cluster(self, cluster: int) -> bool:
+        """Add a cluster to the selection if not present."""
+        if cluster in self._selected_clusters:
+            return False
+        self._selected_clusters.add(cluster)
+        self._sync_legend_checkboxes()
+        self._update_export_action()
+        return True
+
+    def _remove_selected_cluster(self, cluster: int) -> bool:
+        """Remove a cluster from the selection if present."""
+        if cluster not in self._selected_clusters:
+            return False
+        self._selected_clusters.remove(cluster)
+        self._sync_legend_checkboxes()
+        self._update_export_action()
+        return True
+
+    def _clear_selected_clusters(self) -> None:
+        """Clear all selected clusters."""
+        self._selected_clusters.clear()
+        self._sync_legend_checkboxes()
+        self._update_export_action()
+
+    def _sync_legend_checkboxes(self) -> None:
+        """Sync legend checkbox states without triggering cascades."""
+        for cluster_id, checkbox in self.cluster_legend._checkboxes.items():
+            checkbox.blockSignals(True)
+            checkbox.setChecked(cluster_id in self._selected_clusters)
+            checkbox.blockSignals(False)
+
+    def _apply_selected_cluster_styles(self) -> None:
+        """Apply opacity styling to scatter points based on selected clusters."""
         if not self.scatter_view or not self.scatter_view._scatter_items:
             return
-        # If there is no active cluster, restore base opacity for all points
-        if self._active_cluster is None:
-            for item in self.scatter_view._scatter_items:
-                item.setOpacity(0.6)
-            return
-        # Apply cluster-specific opacities
-        # Ensure labels are available
         if self.scatter_view.labels is None:
             return
-        for i, item in enumerate(self.scatter_view._scatter_items):
-            label = int(self.scatter_view.labels[i])
-            if label == self._active_cluster:
-                item.setOpacity(1.0)
-            else:
-                item.setOpacity(0.2)
+        if not self._selected_clusters:
+            for item in self.scatter_view._scatter_items:
+                item.setOpacity(0.6)
+        else:
+            for i, item in enumerate(self.scatter_view._scatter_items):
+                label = int(self.scatter_view.labels[i])
+                item.setOpacity(1.0 if label in self._selected_clusters else 0.2)
+        self._apply_selected_cluster_styles_to_slide()
+
+    def _apply_selected_cluster_styles_to_slide(self) -> None:
+        """Apply opacity styling to slide patches based on selected clusters."""
+        if not self.graphics_view or not self.graphics_view.rect_items:
+            return
+        if self.graphics_view.labels is None:
+            return
+        if not self._selected_clusters:
+            for rect in self.graphics_view.rect_items:
+                rect.setOpacity(0.0)
+        else:
+            selected_opacity = self.graphics_view.highlight_opacity_on
+            for i, rect in enumerate(self.graphics_view.rect_items):
+                label = int(self.graphics_view.labels[i])
+                rect.setOpacity(selected_opacity if label in self._selected_clusters else 0.0)
 
     def _load_current_data(self, recluster_only: bool = False) -> None:
         """Load or recompute data based on current selections.
@@ -1185,9 +2355,11 @@ class MainWindow(QMainWindow):
             when the cluster count changes) without reloading images
             or coordinates.  Defaults to False.
         """
-        # Reset active cluster and disable export action when loading new data
-        self._active_cluster = None
-        self.export_action.setEnabled(False)
+        # Reset selected clusters and disable export action when loading new data
+        self._clear_selected_clusters()
+        self._animation_in_progress = False
+        if self.scatter_view:
+            self.scatter_view.set_animation_active(False)
         
         slide_name = self.slide_combo.currentText()
         selected_models = self._get_selected_models()
@@ -1321,8 +2493,52 @@ class MainWindow(QMainWindow):
             labels = cluster_features(features, k)
             colours = generate_palette(int(labels.max()) + 1)
             print(f"DEBUG: Generated {len(colours)} cluster colours")
-            # Update both views
-            self.graphics_view.load_slide(thumb_image, coords_thumb, self._current_patch_size_thumb, labels, colours)
+
+            # Clear custom cluster names on new data load
+            self.cluster_legend.clear_cluster_names()
+
+            # Update cluster legend
+            self.cluster_legend.update_clusters(labels, colours)
+            
+            # Compute and store centroids
+            self._cluster_centroids = self._compute_centroids(features, labels)
+            self._current_labels = labels
+            
+            # Determine whether to use adaptive or thumbnail mode
+            use_adaptive = (
+                self.adaptive_zoom_action.isChecked() and 
+                data_loader.is_openslide_available()
+            )
+            
+            adaptive_success = False
+            if use_adaptive:
+                print("DEBUG: Attempting adaptive zoom mode")
+                try:
+                    adaptive_success = self.graphics_view.load_slide_adaptive(
+                        info.image_path,
+                        coords_lv0,
+                        patch_size_lv0,
+                        labels,
+                        colours,
+                        (slide_w, slide_h)
+                    )
+                    if adaptive_success:
+                        print("DEBUG: Adaptive zoom mode loaded successfully")
+                except Exception as e:
+                    print(f"DEBUG: Adaptive zoom failed: {e}")
+                    adaptive_success = False
+            
+            if not adaptive_success:
+                # Fall back to thumbnail mode
+                if use_adaptive:
+                    print("DEBUG: Falling back to thumbnail mode")
+                else:
+                    print("DEBUG: Using thumbnail mode")
+                self.graphics_view.load_slide(
+                    thumb_image, coords_thumb, 
+                    self._current_patch_size_thumb, labels, colours
+                )
+            
             # Populate scatter plot using new view
             self.scatter_view.populate(self._current_embedding, labels, colours)
             print("DEBUG: Data loading complete; views updated")
@@ -1339,9 +2555,83 @@ class MainWindow(QMainWindow):
             colours = generate_palette(int(labels.max()) + 1)
             print(f"DEBUG: Generated {len(colours)} cluster colours for reclustering")
 
+            # Clear custom cluster names (cluster IDs change meaning on recluster)
+            self.cluster_legend.clear_cluster_names()
+
+            # Update cluster legend
+            self.cluster_legend.update_clusters(labels, colours)
+            
+            # Compute and store centroids
+            self._cluster_centroids = self._compute_centroids(features, labels)
+            self._current_labels = labels
+            
             # Update both views with new labels and colours
             self.graphics_view.update_labels_and_colours(labels, colours)
             self.scatter_view.populate(self._current_embedding, labels, colours)
+    
+    def _compute_centroids(self, features: np.ndarray, labels: np.ndarray) -> np.ndarray:
+        """Compute centroid of each cluster in feature space.
+        
+        Parameters
+        ----------
+        features : np.ndarray
+            Feature vectors (shape: n_patches x feature_dim).
+        labels : np.ndarray
+            Cluster labels for each patch.
+            
+        Returns
+        -------
+        np.ndarray
+            Centroids array (shape: n_clusters x feature_dim).
+        """
+        n_clusters = int(labels.max()) + 1
+        centroids = np.zeros((n_clusters, features.shape[1]))
+        max_distances = np.zeros(n_clusters)
+        for c in range(n_clusters):
+            mask = labels == c
+            if mask.any():
+                cluster_features = features[mask]
+                centroids[c] = cluster_features.mean(axis=0)
+                # Compute max distance within this cluster
+                distances = np.linalg.norm(cluster_features - centroids[c], axis=1)
+                max_distances[c] = distances.max()
+        # Store max distances for normalization
+        self._max_cluster_distances = max_distances
+        return centroids
+    
+    def _get_distance_to_centroid(self, index: int) -> Optional[float]:
+        """Get normalized distance from a patch to its cluster centroid.
+        
+        Returns distance as a percentage (0-100%) where 100% represents
+        the furthest point within the same cluster.
+        
+        Parameters
+        ----------
+        index : int
+            Patch index.
+            
+        Returns
+        -------
+        Optional[float]
+            Normalized distance as percentage (0-100), or None if data unavailable.
+        """
+        if (self._current_features is None or 
+            self._cluster_centroids is None or
+            self._max_cluster_distances is None or
+            self._current_labels is None or
+            index < 0 or index >= len(self._current_labels)):
+            return None
+        
+        cluster = int(self._current_labels[index])
+        feature_vec = self._current_features[index]
+        centroid = self._cluster_centroids[cluster]
+        distance = np.linalg.norm(feature_vec - centroid)
+        
+        # Normalize by max distance in cluster
+        max_dist = self._max_cluster_distances[cluster]
+        if max_dist > 0:
+            return (distance / max_dist) * 100.0  # Return as percentage
+        return 0.0
 
     def _hsl_string_to_qcolor(self, hsl_string: str) -> QColor:
         """Convert HSL string from generate_palette() to QColor.
@@ -1557,3 +2847,53 @@ class MainWindow(QMainWindow):
         <p><b>Authors:</b> FoundationDetector Contributors</p>
         """
         QMessageBox.about(self, "About FoundationDetector", about_text)
+    
+    def _snap_scatter_dock_to_corner(self) -> None:
+        """Reposition scatter dock to upper-right corner of slide panel."""
+        if not self.scatter_dock.isFloating():
+            return  # Don't reposition if docked to edge
+        
+        # Get slide panel's global position
+        slide_rect = self.graphics_view.geometry()
+        slide_global = self.graphics_view.mapToGlobal(QPoint(0, 0))
+        
+        # Position dock in upper-right with margin
+        dock_size = self.scatter_dock.size()
+        margin = 10
+        x = slide_global.x() + slide_rect.width() - dock_size.width() - margin
+        y = slide_global.y() + margin
+        
+        self.scatter_dock.move(x, y)
+    
+    def _on_scatter_dock_visibility_changed(self, visible: bool) -> None:
+        """Handle scatter dock visibility change to reposition when shown."""
+        if visible and self.scatter_dock.isFloating():
+            # Use QTimer to delay positioning until widget is fully shown
+            QTimer.singleShot(0, self._snap_scatter_dock_to_corner)
+    
+    def resizeEvent(self, event) -> None:
+        """Handle window resize to snap scatter dock."""
+        super().resizeEvent(event)
+        if hasattr(self, 'scatter_dock') and self.scatter_dock.isFloating():
+            self._snap_scatter_dock_to_corner()
+    
+    def moveEvent(self, event) -> None:
+        """Handle window move to snap scatter dock."""
+        super().moveEvent(event)
+        if hasattr(self, 'scatter_dock') and self.scatter_dock.isFloating():
+            self._snap_scatter_dock_to_corner()
+    
+    def showEvent(self, event) -> None:
+        """Position scatter dock in upper-right corner on first show."""
+        super().showEvent(event)
+        if not self._scatter_positioned:
+            self._scatter_positioned = True
+            self._snap_scatter_dock_to_corner()
+    
+    def closeEvent(self, event) -> None:
+        """Handle application close event and clean up resources."""
+        print("DEBUG: Application closing, cleaning up resources")
+        # Clean up tile manager in graphics view
+        if hasattr(self, 'graphics_view'):
+            self.graphics_view.cleanup()
+        super().closeEvent(event)
