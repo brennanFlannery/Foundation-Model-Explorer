@@ -204,6 +204,8 @@ class ScatterGraphicsView(QGraphicsView):
     """
     cluster_selected = Signal(int, bool)
     point_hovered = Signal(int, bool)  # index and hover state
+    # Signal for local region selection mode
+    local_region_selected = Signal(tuple, float)  # (click_point_in_scatter_coords, radius)
 
     def __init__(self, parent: Optional[QWidget] = None):
         """Initialize the scatter view.
@@ -232,6 +234,9 @@ class ScatterGraphicsView(QGraphicsView):
         # Variable to track middle-click panning state
         self._was_panning = False
         self._suppress_clicks = False
+        # Local region selection mode state
+        self._local_region_mode: bool = False
+        self._local_region_radius: float = 50.0
 
     def set_animation_active(self, active: bool) -> None:
         """Set whether a cascade animation is in progress."""
@@ -326,9 +331,17 @@ class ScatterGraphicsView(QGraphicsView):
             self.setCursor(Qt.CursorShape.OpenHandCursor)
             self._was_panning = True
             self._suppress_clicks = True
-        # Forward as left button press to trigger Qt's native drag
+            # Forward as left button press to trigger Qt's native drag
             self._forward_drag_event(event, Qt.MouseButton.LeftButton)
             return
+
+        # Handle local region mode clicks
+        if self._local_region_mode and event.button() == Qt.MouseButton.LeftButton:
+            scene_pos = self.mapToScene(event.position().toPoint())
+            self._handle_local_region_click(scene_pos)
+            event.accept()
+            return
+
         super().mousePressEvent(event)
 
     def mouseReleaseEvent(self, event) -> None:
@@ -348,5 +361,96 @@ class ScatterGraphicsView(QGraphicsView):
         """Zoom in/out with mouse wheel."""
         factor = 1.2 if event.angleDelta().y() > 0 else 0.8
         self.scale(factor, factor)
+
+        # Update local region cursor if in local region mode
+        if self._local_region_mode:
+            self._update_radius_cursor()
+
         event.accept()
+
+    # -------------------------------------------------------------------------
+    # Local Region Selection Mode
+    # -------------------------------------------------------------------------
+
+    def set_local_region_mode(self, enabled: bool, radius: float = 50.0) -> None:
+        """Enable or disable local region selection mode.
+
+        Parameters
+        ----------
+        enabled : bool
+            Whether to enable local region mode.
+        radius : float
+            Initial selection radius in scatter scene coordinates.
+        """
+        self._local_region_mode = enabled
+        self._local_region_radius = radius
+        if enabled:
+            self._update_radius_cursor()
+        else:
+            self.setCursor(Qt.CursorShape.CrossCursor)
+
+    def set_local_region_radius(self, radius: float) -> None:
+        """Update the selection radius.
+
+        Parameters
+        ----------
+        radius : float
+            New selection radius in scatter scene coordinates.
+        """
+        self._local_region_radius = radius
+        if self._local_region_mode:
+            self._update_radius_cursor()
+
+    def _update_radius_cursor(self) -> None:
+        """Create a circle cursor matching the current radius and zoom level."""
+        # Get current zoom scale
+        scale = self.transform().m11()
+
+        # Calculate cursor diameter in screen pixels
+        cursor_diameter = int(self._local_region_radius * 2 * scale)
+
+        # Clamp to reasonable cursor sizes (16-128 pixels)
+        cursor_diameter = max(16, min(cursor_diameter, 128))
+
+        # Create pixmap for cursor
+        pixmap = QPixmap(cursor_diameter, cursor_diameter)
+        pixmap.fill(Qt.GlobalColor.transparent)
+
+        painter = QPainter(pixmap)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+
+        # Draw circle outline
+        pen = QPen(QColor(255, 100, 100, 200))
+        pen.setWidth(2)
+        painter.setPen(pen)
+        painter.setBrush(QBrush(QColor(255, 100, 100, 30)))
+
+        margin = 2
+        painter.drawEllipse(margin, margin,
+                            cursor_diameter - 2 * margin,
+                            cursor_diameter - 2 * margin)
+
+        # Draw center crosshair
+        center = cursor_diameter // 2
+        crosshair_size = min(5, cursor_diameter // 6)
+        painter.drawLine(center - crosshair_size, center, center + crosshair_size, center)
+        painter.drawLine(center, center - crosshair_size, center, center + crosshair_size)
+
+        painter.end()
+
+        # Create cursor with hotspot at center
+        cursor = QCursor(pixmap, cursor_diameter // 2, cursor_diameter // 2)
+        self.setCursor(cursor)
+
+    def _handle_local_region_click(self, scene_pos: QPointF) -> None:
+        """Handle a click in local region mode.
+
+        Parameters
+        ----------
+        scene_pos : QPointF
+            Click position in scene coordinates.
+        """
+        x, y = scene_pos.x(), scene_pos.y()
+        print(f"DEBUG: Scatter local region click at ({x}, {y}) with radius {self._local_region_radius}")
+        self.local_region_selected.emit((x, y), self._local_region_radius)
 

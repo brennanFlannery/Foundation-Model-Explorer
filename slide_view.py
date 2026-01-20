@@ -170,6 +170,8 @@ class SlideGraphicsView(QGraphicsView):
     # Signals for animation synchronization
     patches_highlighted = Signal(list)  # list of patch indices highlighted this step
     animation_completed = Signal()  # emitted when cascade animation finishes
+    # Signal for local region selection mode
+    local_region_selected = Signal(tuple, float)  # (click_point, radius)
     
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         """Initialize the slide view.
@@ -224,6 +226,9 @@ class SlideGraphicsView(QGraphicsView):
         # Variable to track middle-click panning state
         self._was_panning = False
         self._suppress_clicks = False
+        # Local region selection mode state
+        self._local_region_mode: bool = False
+        self._local_region_radius: float = 50.0
 
     def _forward_drag_event(self, event: QMouseEvent, button: Qt.MouseButton) -> None:
         """Forward a synthetic mouse event to Qt for native drag handling."""
@@ -724,9 +729,16 @@ class SlideGraphicsView(QGraphicsView):
         print(f"DEBUG: Nearest patch index={idx}, cluster={cluster}")
         # Record last click position for radial ordering
         self._last_click_pos = (x, y)
-        # Emit signal to main window (cluster number, click position, ctrl state)
-        ctrl_pressed = bool(event.modifiers() & Qt.ControlModifier)
-        self.cluster_selected.emit(cluster, (x, y), ctrl_pressed)
+
+        # Check if in local region mode
+        if self._local_region_mode:
+            # Emit local region selection signal
+            print(f"DEBUG: Local region mode - emitting local_region_selected at ({x}, {y}) with radius {self._local_region_radius}")
+            self.local_region_selected.emit((x, y), self._local_region_radius)
+        else:
+            # Normal K-means mode: emit cluster selection signal
+            ctrl_pressed = bool(event.modifiers() & Qt.ControlModifier)
+            self.cluster_selected.emit(cluster, (x, y), ctrl_pressed)
         # Animation is triggered by the main window to support multi-select
 
     def _start_animation(self, cluster: int, order: List[int],
@@ -833,11 +845,15 @@ class SlideGraphicsView(QGraphicsView):
         factor = 1.25 if event.angleDelta().y() > 0 else 0.8
         print(f"DEBUG: Slide view zoom with factor {factor}")
         self.scale(factor, factor)
-        
+
         # In adaptive mode, update visible tiles after zoom
         if self.tile_manager is not None:
             self._update_visible_tiles()
-        
+
+        # Update local region cursor if in local region mode
+        if self._local_region_mode:
+            self._update_radius_cursor()
+
         event.accept()
     
     def scrollContentsBy(self, dx: int, dy: int) -> None:
@@ -851,8 +867,83 @@ class SlideGraphicsView(QGraphicsView):
     def resizeEvent(self, event) -> None:
         """Handle view resize and update tiles if needed."""
         super().resizeEvent(event)
-        
+
         # In adaptive mode, update visible tiles after resize
         if self.tile_manager is not None:
             self._update_visible_tiles()
+
+    # -------------------------------------------------------------------------
+    # Local Region Selection Mode
+    # -------------------------------------------------------------------------
+
+    def set_local_region_mode(self, enabled: bool, radius: float = 50.0) -> None:
+        """Enable or disable local region selection mode.
+
+        Parameters
+        ----------
+        enabled : bool
+            Whether to enable local region mode.
+        radius : float
+            Initial selection radius in scene coordinates.
+        """
+        self._local_region_mode = enabled
+        self._local_region_radius = radius
+        if enabled:
+            self._update_radius_cursor()
+        else:
+            self.setCursor(Qt.CursorShape.CrossCursor)
+
+    def set_local_region_radius(self, radius: float) -> None:
+        """Update the selection radius.
+
+        Parameters
+        ----------
+        radius : float
+            New selection radius in scene coordinates.
+        """
+        self._local_region_radius = radius
+        if self._local_region_mode:
+            self._update_radius_cursor()
+
+    def _update_radius_cursor(self) -> None:
+        """Create a circle cursor matching the current radius and zoom level."""
+        # Get current zoom scale
+        scale = self.transform().m11()
+
+        # Calculate cursor diameter in screen pixels
+        # Radius is in scene coordinates, scale converts to screen pixels
+        cursor_diameter = int(self._local_region_radius * 2 * scale)
+
+        # Clamp to reasonable cursor sizes (16-128 pixels)
+        cursor_diameter = max(16, min(cursor_diameter, 128))
+
+        # Create pixmap for cursor
+        pixmap = QPixmap(cursor_diameter, cursor_diameter)
+        pixmap.fill(Qt.GlobalColor.transparent)
+
+        painter = QPainter(pixmap)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+
+        # Draw circle outline
+        pen = QPen(QColor(255, 100, 100, 200))
+        pen.setWidth(2)
+        painter.setPen(pen)
+        painter.setBrush(QBrush(QColor(255, 100, 100, 30)))  # Semi-transparent fill
+
+        margin = 2
+        painter.drawEllipse(margin, margin,
+                            cursor_diameter - 2 * margin,
+                            cursor_diameter - 2 * margin)
+
+        # Draw center crosshair
+        center = cursor_diameter // 2
+        crosshair_size = min(5, cursor_diameter // 6)
+        painter.drawLine(center - crosshair_size, center, center + crosshair_size, center)
+        painter.drawLine(center, center - crosshair_size, center, center + crosshair_size)
+
+        painter.end()
+
+        # Create cursor with hotspot at center
+        cursor = QCursor(pixmap, cursor_diameter // 2, cursor_diameter // 2)
+        self.setCursor(cursor)
 

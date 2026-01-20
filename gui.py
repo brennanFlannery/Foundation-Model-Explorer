@@ -71,7 +71,9 @@ from __future__ import annotations
 import json
 import os
 import uuid
-from typing import Dict, List, Optional, Tuple
+from dataclasses import dataclass
+from enum import Enum
+from typing import Dict, List, Optional, Set, Tuple
 import numpy as np
 from shapely.geometry import box
 from shapely.ops import unary_union
@@ -94,7 +96,9 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPushButton,
     QScrollArea,
+    QSlider,
     QSpinBox,
+    QTabWidget,
     QVBoxLayout,
     QWidget,
     QComboBox,
@@ -117,6 +121,24 @@ from PySide6.QtCore import Signal
 
 from scatter_view import ScatterGraphicsItem, ScatterGraphicsView
 from slide_view import SlideGraphicsView
+
+
+class SelectionMode(Enum):
+    """Selection mode for the application."""
+    KMEANS = "kmeans"        # Default - click selects entire K-means cluster
+    LOCAL_REGION = "local"   # Click selects K-means cluster patches within radius
+
+
+@dataclass
+class LocalRegionCluster:
+    """Represents a user-defined local region cluster (subset of K-means cluster)."""
+    cluster_id: int
+    patch_indices: Set[int]  # indices into the patch arrays
+    center_point: Tuple[float, float]  # click center in scene coords
+    radius: float  # radius at time of creation
+    color: QColor
+    name: str
+    kmeans_cluster: int  # the K-means cluster this region belongs to
 
 
 class CheckableComboBoxModel(QAbstractListModel):
@@ -980,6 +1002,252 @@ class ClusterLegendWidget(QWidget):
             return QColor('black')
 
 
+class LocalRegionWidget(QWidget):
+    """Widget for local region selection controls and cluster list.
+
+    This widget provides controls for the local region selection mode,
+    including a radius slider and a list of user-defined regions.
+    """
+
+    # Signals
+    radius_changed = Signal(float)       # Emits new radius value
+    region_clicked = Signal(int)         # Emits region ID for highlighting
+    region_deleted = Signal(int)         # Emits region ID for deletion
+    clear_all_requested = Signal()       # Request to clear all regions
+    export_requested = Signal()          # Request to export regions
+
+    def __init__(self, parent: Optional[QWidget] = None):
+        super().__init__(parent)
+        self._setup_ui()
+        self._region_rows: Dict[int, QWidget] = {}
+
+    def _setup_ui(self) -> None:
+        """Set up the widget UI."""
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(4)
+
+        # Header
+        header = QLabel("Local Region Selection")
+        header.setStyleSheet("font-weight: bold; font-size: 11pt;")
+        layout.addWidget(header)
+
+        # Instructions
+        instructions = QLabel(
+            "Click to select patches within radius\n"
+            "(limited to same K-means cluster)"
+        )
+        instructions.setStyleSheet("color: gray; font-size: 9pt;")
+        instructions.setWordWrap(True)
+        layout.addWidget(instructions)
+
+        # Separator
+        sep = QFrame()
+        sep.setFrameShape(QFrame.Shape.HLine)
+        sep.setFrameShadow(QFrame.Shadow.Sunken)
+        layout.addWidget(sep)
+
+        # Radius slider with label
+        radius_header = QLabel("Selection Radius:")
+        radius_header.setStyleSheet("font-size: 9pt; margin-top: 4px;")
+        layout.addWidget(radius_header)
+
+        radius_row = QHBoxLayout()
+        radius_row.setSpacing(8)
+
+        self.radius_slider = QSlider(Qt.Orientation.Horizontal)
+        self.radius_slider.setRange(10, 500)  # Will be recalculated based on patch size
+        self.radius_slider.setValue(50)
+        self.radius_slider.setTickPosition(QSlider.TickPosition.TicksBelow)
+        self.radius_slider.setTickInterval(50)
+        self.radius_slider.valueChanged.connect(self._on_radius_changed)
+        radius_row.addWidget(self.radius_slider, stretch=1)
+
+        self.radius_label = QLabel("50")
+        self.radius_label.setMinimumWidth(40)
+        self.radius_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        self.radius_label.setStyleSheet("font-size: 9pt;")
+        radius_row.addWidget(self.radius_label)
+
+        layout.addLayout(radius_row)
+
+        # Separator before regions list
+        sep2 = QFrame()
+        sep2.setFrameShape(QFrame.Shape.HLine)
+        sep2.setFrameShadow(QFrame.Shadow.Sunken)
+        layout.addWidget(sep2)
+
+        # Regions header
+        regions_header = QLabel("User-Defined Regions:")
+        regions_header.setStyleSheet("font-size: 9pt; margin-top: 4px;")
+        layout.addWidget(regions_header)
+
+        # Scrollable region list
+        self._scroll = QScrollArea()
+        self._scroll.setWidgetResizable(True)
+        self._scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self._scroll.setFrameShape(QFrame.Shape.NoFrame)
+
+        self._content = QWidget()
+        self._content_layout = QVBoxLayout(self._content)
+        self._content_layout.setContentsMargins(0, 0, 0, 0)
+        self._content_layout.setSpacing(2)
+        self._content_layout.addStretch()
+
+        self._scroll.setWidget(self._content)
+        layout.addWidget(self._scroll, stretch=1)
+
+        # Action buttons
+        btn_row = QHBoxLayout()
+        btn_row.setSpacing(4)
+
+        self.clear_btn = QPushButton("Clear All")
+        self.clear_btn.setStyleSheet("font-size: 9pt;")
+        self.clear_btn.clicked.connect(self.clear_all_requested.emit)
+        self.clear_btn.setEnabled(False)  # Disabled when no regions
+        btn_row.addWidget(self.clear_btn)
+
+        self.export_btn = QPushButton("Export")
+        self.export_btn.setStyleSheet("font-size: 9pt;")
+        self.export_btn.clicked.connect(self.export_requested.emit)
+        self.export_btn.setEnabled(False)  # Disabled when no regions
+        btn_row.addWidget(self.export_btn)
+
+        layout.addLayout(btn_row)
+
+        # Set size constraints
+        self.setMinimumWidth(150)
+        self.setMaximumWidth(200)
+
+    def _on_radius_changed(self, value: int) -> None:
+        """Handle radius slider change."""
+        self.radius_label.setText(str(value))
+        self.radius_changed.emit(float(value))
+
+    def set_radius_range(self, min_val: int, max_val: int, current: int) -> None:
+        """Set radius slider range based on patch size.
+
+        Parameters
+        ----------
+        min_val : int
+            Minimum radius value.
+        max_val : int
+            Maximum radius value.
+        current : int
+            Current/default radius value.
+        """
+        self.radius_slider.blockSignals(True)
+        self.radius_slider.setRange(min_val, max_val)
+        self.radius_slider.setValue(current)
+        self.radius_slider.setTickInterval(max(1, (max_val - min_val) // 10))
+        self.radius_label.setText(str(current))
+        self.radius_slider.blockSignals(False)
+
+    def get_radius(self) -> float:
+        """Get the current radius value."""
+        return float(self.radius_slider.value())
+
+    def add_region(self, region_id: int, patch_count: int,
+                   color: QColor, name: str) -> None:
+        """Add a new region row to the list.
+
+        Parameters
+        ----------
+        region_id : int
+            Unique identifier for the region.
+        patch_count : int
+            Number of patches in the region.
+        color : QColor
+            Color for the region display.
+        name : str
+            Display name for the region.
+        """
+        row = QWidget()
+        row.setProperty("region_id", region_id)
+        row.setCursor(Qt.CursorShape.PointingHandCursor)
+        row.installEventFilter(self)
+
+        row_layout = QHBoxLayout(row)
+        row_layout.setContentsMargins(2, 2, 2, 2)
+        row_layout.setSpacing(6)
+
+        # Color square
+        color_square = QFrame()
+        color_square.setFixedSize(14, 14)
+        hex_color = color.name()
+        color_square.setStyleSheet(
+            f"background-color: {hex_color}; "
+            f"border: 1px solid #666; border-radius: 2px;"
+        )
+        row_layout.addWidget(color_square)
+
+        # Region name label
+        label = QLabel(name)
+        label.setStyleSheet("font-size: 9pt;")
+        label.setObjectName("region_label")
+        row_layout.addWidget(label)
+
+        # Spacer
+        row_layout.addStretch()
+
+        # Count
+        count_label = QLabel(f"({patch_count:,})")
+        count_label.setStyleSheet("color: #888; font-size: 9pt;")
+        row_layout.addWidget(count_label)
+
+        # Delete button
+        delete_btn = QPushButton("×")
+        delete_btn.setFixedSize(18, 18)
+        delete_btn.setStyleSheet(
+            "QPushButton { font-size: 12pt; color: #888; border: none; padding: 0; }"
+            "QPushButton:hover { color: #ff4444; }"
+        )
+        delete_btn.setToolTip("Delete region")
+        delete_btn.clicked.connect(lambda: self.region_deleted.emit(region_id))
+        row_layout.addWidget(delete_btn)
+
+        # Insert before the stretch
+        self._content_layout.insertWidget(
+            self._content_layout.count() - 1, row
+        )
+        self._region_rows[region_id] = row
+
+        # Enable buttons
+        self.clear_btn.setEnabled(True)
+        self.export_btn.setEnabled(True)
+
+    def remove_region(self, region_id: int) -> None:
+        """Remove a region row from the list."""
+        row = self._region_rows.pop(region_id, None)
+        if row is not None:
+            row.deleteLater()
+
+        # Disable buttons if no regions
+        if not self._region_rows:
+            self.clear_btn.setEnabled(False)
+            self.export_btn.setEnabled(False)
+
+    def clear_regions(self) -> None:
+        """Remove all region rows."""
+        for row in self._region_rows.values():
+            row.deleteLater()
+        self._region_rows.clear()
+        self.clear_btn.setEnabled(False)
+        self.export_btn.setEnabled(False)
+
+    def eventFilter(self, obj: QObject, event) -> bool:
+        """Handle mouse events on region rows."""
+        from PySide6.QtCore import QEvent
+
+        if event.type() == QEvent.Type.MouseButtonPress:
+            region_id = obj.property("region_id")
+            if region_id is not None:
+                if event.button() == Qt.MouseButton.LeftButton:
+                    self.region_clicked.emit(region_id)
+                    return True
+        return super().eventFilter(obj, event)
+
+
 class MainWindow(QMainWindow):
     """Main application window for FoundationDetector.
     
@@ -1083,6 +1351,11 @@ class MainWindow(QMainWindow):
         self._current_labels: Optional[np.ndarray] = None
         # Track cascade animation state to prevent hover interference
         self._animation_in_progress: bool = False
+        # Local region selection mode state
+        self._selection_mode: SelectionMode = SelectionMode.KMEANS
+        self._local_region_clusters: Dict[int, LocalRegionCluster] = {}
+        self._next_local_cluster_id: int = 0
+        self._local_region_radius: float = 50.0
 
     def _create_widgets(self) -> None:
         """Create and lay out widgets for the main window."""
@@ -1142,22 +1415,48 @@ class MainWindow(QMainWindow):
         
         # Horizontal layout for legend + info panel + slide view
         content_layout = QHBoxLayout()
-        
-        # Left sidebar: cluster legend + patch info panel
-        left_sidebar = QVBoxLayout()
-        
-        # Cluster legend widget
+
+        # Left sidebar: tabbed widget with K-means clusters and Local Region selection
+        self.sidebar_tabs = QTabWidget()
+        self.sidebar_tabs.setMinimumWidth(170)
+        self.sidebar_tabs.setMaximumWidth(220)
+
+        # Tab 1: K-means Clusters (existing ClusterLegendWidget)
+        kmeans_tab = QWidget()
+        kmeans_layout = QVBoxLayout(kmeans_tab)
+        kmeans_layout.setContentsMargins(0, 0, 0, 0)
         self.cluster_legend = ClusterLegendWidget()
-        left_sidebar.addWidget(self.cluster_legend)
-        # Connect legend signals
+        kmeans_layout.addWidget(self.cluster_legend)
+        kmeans_layout.addStretch()
+        self.sidebar_tabs.addTab(kmeans_tab, "K-means")
+
+        # Connect K-means legend signals
         self.cluster_legend.cluster_clicked.connect(self._on_legend_cluster_clicked)
         self.cluster_legend.cluster_toggled.connect(self._on_legend_cluster_toggled)
         self.cluster_legend.cluster_rename.connect(self._on_rename_cluster)
         self.cluster_legend.cluster_export.connect(self._on_export_single_cluster)
         self.cluster_legend.export_all_requested.connect(self._on_export_all_clusters)
 
-        left_sidebar.addStretch()
-        content_layout.addLayout(left_sidebar)
+        # Tab 2: Local Region Selection (new LocalRegionWidget)
+        local_tab = QWidget()
+        local_layout = QVBoxLayout(local_tab)
+        local_layout.setContentsMargins(0, 0, 0, 0)
+        self.local_region_widget = LocalRegionWidget()
+        local_layout.addWidget(self.local_region_widget)
+        local_layout.addStretch()
+        self.sidebar_tabs.addTab(local_tab, "Local Region")
+
+        # Connect Local Region widget signals
+        self.local_region_widget.radius_changed.connect(self._on_local_region_radius_changed)
+        self.local_region_widget.region_clicked.connect(self._on_local_region_clicked)
+        self.local_region_widget.region_deleted.connect(self._on_local_region_deleted)
+        self.local_region_widget.clear_all_requested.connect(self._clear_local_region_clusters)
+        self.local_region_widget.export_requested.connect(self._export_local_region_clusters)
+
+        # Connect tab change to mode switch
+        self.sidebar_tabs.currentChanged.connect(self._on_sidebar_tab_changed)
+
+        content_layout.addWidget(self.sidebar_tabs)
         
         # Main slide view (takes remaining width)
         self.graphics_view = SlideGraphicsView()
@@ -1171,6 +1470,8 @@ class MainWindow(QMainWindow):
         # Connect slide animation signals for synchronized scatter cascade
         self.graphics_view.patches_highlighted.connect(self._on_patches_highlighted)
         self.graphics_view.animation_completed.connect(self._on_animation_completed)
+        # Connect local region selection signal
+        self.graphics_view.local_region_selected.connect(self._on_local_region_selected)
         content_layout.addWidget(self.graphics_view, stretch=1)
         
         main_vbox.addLayout(content_layout, stretch=1)
@@ -1182,7 +1483,9 @@ class MainWindow(QMainWindow):
         self.scatter_view.cluster_selected.connect(self._on_scatter_cluster_selected)
         # Connect scatter hover to highlight slide and scatter
         self.scatter_view.point_hovered.connect(self._on_scatter_point_hovered)
-        
+        # Connect local region selection signal
+        self.scatter_view.local_region_selected.connect(self._on_scatter_local_region_selected)
+
         # Create dock widget for scatter view
         self.scatter_dock = QDockWidget("Embedding View", self)
         self.scatter_dock.setWidget(self.scatter_view)
@@ -1960,7 +2263,7 @@ class MainWindow(QMainWindow):
 
     def _on_animation_completed(self) -> None:
         """Apply persistent styling when cascade animation finishes.
-        
+
         This handler is called by the animation_completed signal from
         SlideGraphicsView when the cascade animation finishes. It applies
         the persistent opacity styling to maintain the low/high distinction
@@ -1970,7 +2273,12 @@ class MainWindow(QMainWindow):
         # Mark animation as complete
         self._animation_in_progress = False
         self.scatter_view.set_animation_active(False)
-        self._apply_selected_cluster_styles()
+
+        # Apply correct styling based on current selection mode
+        if self._selection_mode == SelectionMode.LOCAL_REGION:
+            self._apply_local_region_cluster_styles()
+        else:
+            self._apply_selected_cluster_styles()
 
     def _merge_cluster_patches(self, cluster: int) -> List[List]:
         """Merge adjacent patches into continuous polygons.
@@ -2897,3 +3205,514 @@ class MainWindow(QMainWindow):
         if hasattr(self, 'graphics_view'):
             self.graphics_view.cleanup()
         super().closeEvent(event)
+
+    # -------------------------------------------------------------------------
+    # Local Region Selection Mode
+    # -------------------------------------------------------------------------
+
+    def _on_sidebar_tab_changed(self, index: int) -> None:
+        """Handle sidebar tab change to switch selection modes."""
+        if index == 0:  # K-means tab
+            self._set_selection_mode(SelectionMode.KMEANS)
+        elif index == 1:  # Local Region tab
+            self._set_selection_mode(SelectionMode.LOCAL_REGION)
+
+    def _set_selection_mode(self, mode: SelectionMode) -> None:
+        """Switch between K-means and Local Region selection modes."""
+        self._selection_mode = mode
+        print(f"DEBUG: Selection mode changed to {mode.value}")
+
+        if mode == SelectionMode.LOCAL_REGION:
+            # Calculate radius range based on current data
+            min_r, max_r, default_r = self._calculate_radius_range()
+            self.local_region_widget.set_radius_range(min_r, max_r, default_r)
+            self._local_region_radius = float(default_r)
+
+            # Enable local region mode in views
+            self.graphics_view.set_local_region_mode(True, self._local_region_radius)
+
+            # Translate radius to scatter space and enable in scatter view
+            scatter_radius = self._translate_radius_to_scatter(self._local_region_radius)
+            self.scatter_view.set_local_region_mode(True, scatter_radius)
+
+            # Apply local region cluster styles (show user-defined regions)
+            self._apply_local_region_cluster_styles()
+        else:
+            # Disable local region mode
+            self.graphics_view.set_local_region_mode(False)
+            self.scatter_view.set_local_region_mode(False)
+
+            # Restore K-means cluster styles
+            self._apply_selected_cluster_styles()
+
+    def _on_local_region_radius_changed(self, radius: float) -> None:
+        """Handle radius slider change."""
+        self._local_region_radius = radius
+        self.graphics_view.set_local_region_radius(radius)
+
+        # Translate to scatter space
+        scatter_radius = self._translate_radius_to_scatter(radius)
+        self.scatter_view.set_local_region_radius(scatter_radius)
+
+    def _calculate_radius_range(self) -> Tuple[int, int, int]:
+        """Calculate intelligent radius range based on current data.
+
+        Returns
+        -------
+        Tuple[int, int, int]
+            (min_radius, max_radius, default_radius) in scene coordinates.
+        """
+        patch_size = self.graphics_view.patch_size
+        if not patch_size or patch_size == 0:
+            return (10, 500, 50)  # Defaults if no data
+
+        # Minimum: 0.5x patch size (select single patch)
+        min_radius = int(patch_size * 0.5)
+
+        # Default: 2x patch size (select ~4-9 adjacent patches)
+        default_radius = int(patch_size * 2)
+
+        # Maximum: Estimate from coordinate bounds
+        if self.graphics_view.coords is not None and len(self.graphics_view.coords) > 0:
+            coords = self.graphics_view.coords
+            x_range = coords[:, 0].max() - coords[:, 0].min()
+            y_range = coords[:, 1].max() - coords[:, 1].min()
+            scene_diagonal = np.sqrt(x_range ** 2 + y_range ** 2)
+            max_radius = int(scene_diagonal * 0.25)  # Max 25% of scene diagonal
+        else:
+            max_radius = int(patch_size * 20)  # Fallback: 20x patch size
+
+        # Ensure sensible values
+        min_radius = max(10, min_radius)
+        max_radius = max(min_radius + 10, max_radius)
+        default_radius = max(min_radius, min(default_radius, max_radius))
+
+        return (min_radius, max_radius, default_radius)
+
+    def _translate_radius_to_scatter(self, slide_radius: float) -> float:
+        """Translate radius from slide scene coordinates to scatter coordinates.
+
+        Parameters
+        ----------
+        slide_radius : float
+            Radius in slide scene coordinates.
+
+        Returns
+        -------
+        float
+            Radius in scatter scene coordinates.
+        """
+        if self.graphics_view.coords is None or len(self.graphics_view.coords) == 0:
+            return slide_radius
+
+        # Get extent in slide coordinate space
+        coords = self.graphics_view.coords
+        x_range = coords[:, 0].max() - coords[:, 0].min()
+        y_range = coords[:, 1].max() - coords[:, 1].min()
+        slide_extent = max(x_range, y_range)
+
+        if slide_extent == 0:
+            return slide_radius
+
+        # Scatter is normalized to 400x400 with 20px padding = 360 usable
+        scatter_extent = 360.0
+
+        # Scale factor
+        scale = scatter_extent / slide_extent
+        return slide_radius * scale
+
+    def _on_local_region_selected(self, click_point: Tuple[float, float], radius: float) -> None:
+        """Handle local region selection from slide view.
+
+        Parameters
+        ----------
+        click_point : Tuple[float, float]
+            Click position in slide scene coordinates.
+        radius : float
+            Selection radius.
+        """
+        if self.graphics_view.coords is None or self.graphics_view.labels is None:
+            return
+
+        coords = self.graphics_view.coords
+        labels = self.graphics_view.labels
+        patch_size = self.graphics_view.patch_size
+
+        # Find nearest patch to get K-means cluster
+        patch_centers = coords + patch_size / 2.0
+        diffs = patch_centers - np.array(click_point)
+        dists_sq = np.einsum('ij,ij->i', diffs, diffs)
+        nearest_idx = int(np.argmin(dists_sq))
+        kmeans_cluster = int(labels[nearest_idx])
+
+        # Calculate effective radius accounting for cursor clamping
+        # The cursor is clamped to 16-128 pixels, so we must match that in selection
+        scale = self.graphics_view.transform().m11()
+        cursor_diameter = radius * 2 * scale
+        if cursor_diameter > 128:
+            effective_radius = 64.0 / scale  # Match clamped cursor (128/2 = 64 pixels)
+        elif cursor_diameter < 16:
+            effective_radius = 8.0 / scale   # Match min cursor (16/2 = 8 pixels)
+        else:
+            effective_radius = radius
+
+        # Find patches that are both in the K-means cluster AND within effective radius
+        distances = np.sqrt(dists_sq)
+        in_cluster = labels == kmeans_cluster
+        in_radius = distances <= effective_radius
+        selected_mask = in_cluster & in_radius
+        selected_indices = set(np.where(selected_mask)[0])
+
+        if not selected_indices:
+            print("DEBUG: No patches selected (K-means cluster + radius filter)")
+            return
+
+        # Create new local region cluster
+        self._create_local_region_cluster(
+            selected_indices, click_point, radius, kmeans_cluster
+        )
+
+    def _on_scatter_local_region_selected(self, click_point: Tuple[float, float], radius: float) -> None:
+        """Handle local region selection from scatter view.
+
+        Parameters
+        ----------
+        click_point : Tuple[float, float]
+            Click position in scatter scene coordinates.
+        radius : float
+            Selection radius in scatter coordinates.
+        """
+        if self._current_embedding is None or self.graphics_view.labels is None:
+            return
+
+        from utils import normalize_to_scene
+
+        labels = self.graphics_view.labels
+        scatter_coords = normalize_to_scene(self._current_embedding, 400, 400, 20)
+
+        # Find nearest point to get K-means cluster
+        diffs = scatter_coords - np.array(click_point)
+        dists_sq = np.einsum('ij,ij->i', diffs, diffs)
+        nearest_idx = int(np.argmin(dists_sq))
+        kmeans_cluster = int(labels[nearest_idx])
+
+        # Calculate effective radius accounting for cursor clamping
+        # The cursor is clamped to 16-128 pixels, so we must match that in selection
+        scale = self.scatter_view.transform().m11()
+        cursor_diameter = radius * 2 * scale
+        if cursor_diameter > 128:
+            effective_radius = 64.0 / scale  # Match clamped cursor (128/2 = 64 pixels)
+        elif cursor_diameter < 16:
+            effective_radius = 8.0 / scale   # Match min cursor (16/2 = 8 pixels)
+        else:
+            effective_radius = radius
+
+        # Find points that are both in the K-means cluster AND within effective radius (in scatter space)
+        distances = np.sqrt(dists_sq)
+        in_cluster = labels == kmeans_cluster
+        in_radius = distances <= effective_radius
+        selected_mask = in_cluster & in_radius
+        selected_indices = set(np.where(selected_mask)[0])
+
+        if not selected_indices:
+            print("DEBUG: No patches selected from scatter (K-means cluster + radius filter)")
+            return
+
+        # For the local region cluster, we need the slide coordinates
+        if self.graphics_view.coords is not None:
+            patch_centers = self.graphics_view.coords + self.graphics_view.patch_size / 2.0
+            # Use centroid of selected patches in slide space as click point
+            selected_coords = patch_centers[list(selected_indices)]
+            slide_click_point = (float(selected_coords[:, 0].mean()), float(selected_coords[:, 1].mean()))
+            slide_radius = self._local_region_radius  # Use slide radius for storage
+        else:
+            slide_click_point = click_point
+            slide_radius = radius
+
+        self._create_local_region_cluster(
+            selected_indices, slide_click_point, slide_radius, kmeans_cluster
+        )
+
+    def _create_local_region_cluster(self, patch_indices: Set[int],
+                                      center_point: Tuple[float, float],
+                                      radius: float, kmeans_cluster: int) -> None:
+        """Create a new local region cluster.
+
+        Parameters
+        ----------
+        patch_indices : Set[int]
+            Indices of patches in this region.
+        center_point : Tuple[float, float]
+            Center point of the selection.
+        radius : float
+            Radius used for selection.
+        kmeans_cluster : int
+            The K-means cluster this region belongs to.
+        """
+        cluster_id = self._next_local_cluster_id
+        self._next_local_cluster_id += 1
+
+        # Use K-means cluster color directly (no modification)
+        if self.graphics_view.cluster_colors and kmeans_cluster < len(self.graphics_view.cluster_colors):
+            color = self.graphics_view.cluster_colors[kmeans_cluster]
+        else:
+            color = QColor(128, 128, 128)  # Fallback gray
+
+        # Create cluster data
+        cluster = LocalRegionCluster(
+            cluster_id=cluster_id,
+            patch_indices=patch_indices,
+            center_point=center_point,
+            radius=radius,
+            color=color,
+            name=f"Region {cluster_id}",
+            kmeans_cluster=kmeans_cluster
+        )
+        self._local_region_clusters[cluster_id] = cluster
+
+        # Update UI
+        self.local_region_widget.add_region(
+            cluster_id, len(patch_indices), color, cluster.name
+        )
+
+        print(f"DEBUG: Created local region cluster {cluster_id} with {len(patch_indices)} patches")
+
+        # Trigger cascade animation for the new cluster
+        self._trigger_local_region_cascade(cluster_id, center_point)
+
+    def _trigger_local_region_cascade(self, cluster_id: int, click_point: Tuple[float, float]) -> None:
+        """Trigger cascade animation for a local region cluster.
+
+        Parameters
+        ----------
+        cluster_id : int
+            The local region cluster ID.
+        click_point : Tuple[float, float]
+            Click point for radial ordering.
+        """
+        cluster = self._local_region_clusters.get(cluster_id)
+        if not cluster:
+            return
+
+        indices = list(cluster.patch_indices)
+        if not indices:
+            return
+
+        # Get coordinates for radial ordering
+        patch_centers = self.graphics_view.coords + self.graphics_view.patch_size / 2.0
+        cluster_coords = patch_centers[indices]
+
+        # Order by distance from click point
+        order_local = radial_sweep_order(cluster_coords, click_point)
+        order_global = [indices[i] for i in order_local]
+
+        # Set patches to cluster color and dim before animation
+        for idx in indices:
+            rect = self.graphics_view.rect_items[idx]
+            rect.setBrush(QBrush(cluster.color))
+            rect.setOpacity(self.graphics_view.highlight_opacity_off)
+
+        # Dim all other patches
+        for i, rect in enumerate(self.graphics_view.rect_items):
+            if i not in cluster.patch_indices:
+                rect.setOpacity(0.0)
+
+        # Prepare scatter view
+        self._prepare_scatter_for_local_region(cluster_id)
+
+        # Start animation
+        self._animation_in_progress = True
+        self.scatter_view.set_animation_active(True)
+        self.graphics_view._start_animation(
+            cluster.kmeans_cluster, order_global, set()
+        )
+
+    def _prepare_scatter_for_local_region(self, cluster_id: int) -> None:
+        """Prepare scatter view for local region cascade animation.
+
+        Parameters
+        ----------
+        cluster_id : int
+            The local region cluster ID.
+        """
+        cluster = self._local_region_clusters.get(cluster_id)
+        if not cluster:
+            return
+
+        # Dim all scatter points
+        for item in self.scatter_view._scatter_items:
+            if item.index in cluster.patch_indices:
+                item.setOpacity(0.2)  # Will be animated to 1.0
+            else:
+                item.setOpacity(0.1)  # Very dim for non-selected
+
+    def _on_local_region_clicked(self, region_id: int) -> None:
+        """Handle click on a local region in the widget list.
+
+        Parameters
+        ----------
+        region_id : int
+            The region ID that was clicked.
+        """
+        cluster = self._local_region_clusters.get(region_id)
+        if not cluster:
+            return
+
+        # Highlight this region
+        self._apply_local_region_cluster_styles()
+
+        # Highlight selected region patches
+        for idx in cluster.patch_indices:
+            if 0 <= idx < len(self.graphics_view.rect_items):
+                rect = self.graphics_view.rect_items[idx]
+                rect.setBrush(QBrush(cluster.color))
+                rect.setOpacity(0.8)
+
+        # Highlight in scatter view
+        for item in self.scatter_view._scatter_items:
+            if item.index in cluster.patch_indices:
+                item.setOpacity(1.0)
+
+    def _on_local_region_deleted(self, region_id: int) -> None:
+        """Handle deletion of a local region.
+
+        Parameters
+        ----------
+        region_id : int
+            The region ID to delete.
+        """
+        if region_id in self._local_region_clusters:
+            del self._local_region_clusters[region_id]
+            self.local_region_widget.remove_region(region_id)
+            self._apply_local_region_cluster_styles()
+            print(f"DEBUG: Deleted local region cluster {region_id}")
+
+    def _clear_local_region_clusters(self) -> None:
+        """Clear all local region clusters."""
+        self._local_region_clusters.clear()
+        self._next_local_cluster_id = 0
+        self.local_region_widget.clear_regions()
+        self._apply_local_region_cluster_styles()
+        print("DEBUG: Cleared all local region clusters")
+
+    def _apply_local_region_cluster_styles(self) -> None:
+        """Apply styling to show local region clusters."""
+        if not self.graphics_view.rect_items:
+            return
+
+        # Reset all patches to invisible
+        for rect in self.graphics_view.rect_items:
+            rect.setOpacity(0.0)
+
+        # For each local region cluster, set patch colors and opacities
+        for cluster_id, cluster in self._local_region_clusters.items():
+            for idx in cluster.patch_indices:
+                if 0 <= idx < len(self.graphics_view.rect_items):
+                    rect = self.graphics_view.rect_items[idx]
+                    rect.setBrush(QBrush(cluster.color))
+                    rect.setOpacity(0.6)
+
+        # Apply same to scatter view
+        self._apply_local_region_scatter_styles()
+
+    def _apply_local_region_scatter_styles(self) -> None:
+        """Apply local region styles to scatter view."""
+        if not self.scatter_view._scatter_items:
+            return
+
+        # Collect all selected indices
+        all_selected = set()
+        for cluster in self._local_region_clusters.values():
+            all_selected.update(cluster.patch_indices)
+
+        # Set opacities
+        for item in self.scatter_view._scatter_items:
+            if item.index in all_selected:
+                item.setOpacity(1.0)
+            else:
+                item.setOpacity(0.2)
+
+    def _export_local_region_clusters(self) -> None:
+        """Export local region clusters to GeoJSON."""
+        if not self._local_region_clusters:
+            QMessageBox.warning(self, "No Regions", "No local regions to export.")
+            return
+
+        # Similar to _export_all_clusters but for local regions
+        file_path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Export Local Regions as GeoJSON",
+            "",
+            "GeoJSON Files (*.geojson);;All Files (*)"
+        )
+        if not file_path:
+            return
+
+        self._write_local_regions_geojson(file_path)
+
+    def _write_local_regions_geojson(self, file_path: str) -> None:
+        """Write local region clusters to a GeoJSON file.
+
+        Parameters
+        ----------
+        file_path : str
+            Path to the output file.
+        """
+        # Use level-0 coordinates if available, otherwise thumbnail coordinates
+        if self._current_coords_lv0 is not None:
+            coords = self._current_coords_lv0
+            patch_size = self._current_patch_size_lv0
+        else:
+            coords = self.graphics_view.coords
+            patch_size = self.graphics_view.patch_size
+
+        if coords is None:
+            QMessageBox.warning(self, "Export Error", "No coordinate data available.")
+            return
+
+        features = []
+
+        for cluster_id, cluster in self._local_region_clusters.items():
+            # Create boxes for each patch in the cluster
+            boxes = []
+            for idx in cluster.patch_indices:
+                if 0 <= idx < len(coords):
+                    x, y = coords[idx]
+                    boxes.append(box(x, y, x + patch_size, y + patch_size))
+
+            if boxes:
+                # Merge overlapping boxes
+                merged = unary_union(boxes)
+
+                # Get color as hex
+                color_hex = cluster.color.name()
+
+                feature = {
+                    "type": "Feature",
+                    "geometry": merged.__geo_interface__,
+                    "properties": {
+                        "classification": {
+                            "name": cluster.name,
+                            "colorRGB": int(color_hex.replace('#', ''), 16)
+                        },
+                        "region_id": cluster_id,
+                        "patch_count": len(cluster.patch_indices),
+                        "kmeans_cluster": cluster.kmeans_cluster
+                    }
+                }
+                features.append(feature)
+
+        geojson = {
+            "type": "FeatureCollection",
+            "features": features
+        }
+
+        with open(file_path, 'w') as f:
+            json.dump(geojson, f, indent=2)
+
+        print(f"DEBUG: Exported {len(features)} local regions to {file_path}")
+        QMessageBox.information(
+            self,
+            "Export Complete",
+            f"Exported {len(features)} local regions to:\n{file_path}"
+        )
