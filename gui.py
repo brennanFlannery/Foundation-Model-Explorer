@@ -77,7 +77,18 @@ from typing import Dict, List, Optional, Set, Tuple
 import numpy as np
 from shapely.geometry import box
 from shapely.ops import unary_union
-from PySide6.QtCore import Qt, QTimer, QPointF, QObject, QPoint, QPropertyAnimation, QEasingCurve
+from PySide6.QtCore import (
+    Qt,
+    QTimer,
+    QPointF,
+    QObject,
+    QPoint,
+    QPropertyAnimation,
+    QEasingCurve,
+    QSize,
+    QThreadPool,
+    QRunnable,
+)
 from PySide6.QtGui import QColor, QImage, QPixmap, QPainter, QCursor
 from PySide6.QtWidgets import (
     QApplication,
@@ -107,6 +118,11 @@ from PySide6.QtWidgets import (
     QProgressBar,
     QGraphicsDropShadowEffect,
     QMenu,
+    QStackedLayout,
+    QSizePolicy,
+    QSplitter,
+    QDialog,
+    QDialogButtonBox,
 )
 from PySide6.QtGui import QAction
 from PySide6.QtCore import QSettings, QAbstractListModel, QModelIndex
@@ -115,12 +131,15 @@ from sklearn.decomposition import PCA
 from PySide6.QtGui import QPen, QBrush
 from PySide6.QtCore import QRectF
 from PIL import Image
+from PIL.ImageQt import ImageQt
 import data_loader
 from utils import generate_palette, cluster_features, infer_slide_dims, radial_sweep_order
 from PySide6.QtCore import Signal
 
 from scatter_view import ScatterGraphicsItem, ScatterGraphicsView
 from slide_view import SlideGraphicsView
+from atlas_builder import AtlasBuilder, ClusterAtlas, SlideAtlasEntry
+from atlas_scatter_view import AtlasScatterView
 
 
 class SelectionMode(Enum):
@@ -139,6 +158,14 @@ class LocalRegionCluster:
     color: QColor
     name: str
     kmeans_cluster: int  # the K-means cluster this region belongs to
+
+
+@dataclass
+class ModelSelection:
+    """Represents a selected model configuration for feature loading."""
+    models: List[str]
+    magnification: str
+    patch_size: str
 
 
 class CheckableComboBoxModel(QAbstractListModel):
@@ -225,6 +252,16 @@ class CheckableComboBoxModel(QAbstractListModel):
         """Set tooltip for a specific item."""
         if item in self._tooltips:
             self._tooltips[item] = tooltip
+
+    def setCheckedItems(self, items: List[str]) -> None:
+        """Set the checked state for multiple items."""
+        target = set(items)
+        for item in self._items:
+            self._checked[item] = item in target and self._enabled[item]
+        if self._items:
+            top = self.index(0)
+            bottom = self.index(len(self._items) - 1)
+            self.dataChanged.emit(top, bottom, [QtCore.CheckStateRole])
 
 
 class ModelMultiSelector(QComboBox):
@@ -335,6 +372,11 @@ class ModelMultiSelector(QComboBox):
     def setModelToolTip(self, model_name: str, tooltip: str):
         """Set tooltip for a specific model item."""
         self._model.setItemToolTip(model_name, tooltip)
+
+    def setSelectedModels(self, models: List[str]) -> None:
+        """Programmatically select a list of models."""
+        self._model.setCheckedItems(models)
+        self._update_text()
 
 
 class PatchInfoPanel(QWidget):
@@ -1193,6 +1235,7 @@ class LocalRegionWidget(QWidget):
         # Count
         count_label = QLabel(f"({patch_count:,})")
         count_label.setStyleSheet("color: #888; font-size: 9pt;")
+        count_label.setObjectName("region_count")
         row_layout.addWidget(count_label)
 
         # Delete button
@@ -1215,6 +1258,20 @@ class LocalRegionWidget(QWidget):
         # Enable buttons
         self.clear_btn.setEnabled(True)
         self.export_btn.setEnabled(True)
+
+    def update_region(self, region_id: int, patch_count: int, name: Optional[str] = None) -> None:
+        """Update an existing region row."""
+        row = self._region_rows.get(region_id)
+        if row is None:
+            return
+
+        label = row.findChild(QLabel, "region_label")
+        if label is not None and name is not None:
+            label.setText(name)
+
+        count_label = row.findChild(QLabel, "region_count")
+        if count_label is not None:
+            count_label.setText(f"({patch_count:,})")
 
     def remove_region(self, region_id: int) -> None:
         """Remove a region row from the list."""
@@ -1246,6 +1303,505 @@ class LocalRegionWidget(QWidget):
                     self.region_clicked.emit(region_id)
                     return True
         return super().eventFilter(obj, event)
+
+
+class AtlasSlideListWidget(QWidget):
+    """Widget for displaying and managing slides in the atlas builder.
+
+    This widget shows a list of slides that have been added to the atlas,
+    with controls to remove individual slides.
+
+    Signals
+    -------
+    slide_removed(str)
+        Emitted when a slide is removed from the list.
+    selection_changed()
+        Emitted when the slide selection changes.
+    """
+    slide_removed = Signal(str)
+    selection_changed = Signal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._setup_ui()
+        self._slide_data: Dict[str, Dict] = {}  # slide_name -> {features, coords, h5_path}
+
+    def _setup_ui(self) -> None:
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(2)
+
+        # Scroll area for slide items
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        scroll.setFrameShape(QFrame.NoFrame)
+
+        self._content = QWidget()
+        self._content_layout = QVBoxLayout(self._content)
+        self._content_layout.setContentsMargins(0, 0, 0, 0)
+        self._content_layout.setSpacing(2)
+        self._content_layout.addStretch()
+
+        scroll.setWidget(self._content)
+        layout.addWidget(scroll)
+
+        self._slide_rows: Dict[str, QWidget] = {}
+
+    def add_slide(self, slide_name: str, features: np.ndarray, coords: np.ndarray,
+                  h5_path: str = "", color: QColor = None) -> None:
+        """Add a slide to the list.
+
+        Parameters
+        ----------
+        slide_name : str
+            Name of the slide.
+        features : np.ndarray
+            Feature vectors.
+        coords : np.ndarray
+            Patch coordinates.
+        h5_path : str
+            Path to the HDF5 file.
+        color : QColor, optional
+            Display color for the slide.
+        """
+        if slide_name in self._slide_rows:
+            return  # Already added
+
+        # Store data
+        self._slide_data[slide_name] = {
+            'features': features,
+            'coords': coords,
+            'h5_path': h5_path
+        }
+
+        # Create row widget
+        row = QFrame()
+        row.setFrameShape(QFrame.StyledPanel)
+        row.setStyleSheet(
+            "QFrame { background-color: #f0f0f0; border-radius: 3px; padding: 2px; }"
+            "QFrame:hover { background-color: #e0e0e0; }"
+        )
+        row_layout = QHBoxLayout(row)
+        row_layout.setContentsMargins(5, 3, 5, 3)
+        row_layout.setSpacing(5)
+
+        # Color indicator
+        if color:
+            color_label = QLabel()
+            color_label.setFixedSize(12, 12)
+            color_label.setStyleSheet(
+                f"background-color: {color.name()}; border-radius: 6px;"
+            )
+            row_layout.addWidget(color_label)
+
+        # Slide name
+        name_label = QLabel(slide_name[:25] + "..." if len(slide_name) > 25 else slide_name)
+        name_label.setToolTip(slide_name)
+        row_layout.addWidget(name_label, stretch=1)
+
+        # Patch count
+        count_label = QLabel(f"({len(features):,})")
+        count_label.setStyleSheet("color: gray; font-size: 9px;")
+        row_layout.addWidget(count_label)
+
+        # Remove button
+        remove_btn = QPushButton("×")
+        remove_btn.setFixedSize(18, 18)
+        remove_btn.setStyleSheet(
+            "QPushButton { font-size: 12pt; color: #888; border: none; }"
+            "QPushButton:hover { color: #ff4444; }"
+        )
+        remove_btn.setToolTip("Remove from atlas")
+        remove_btn.clicked.connect(lambda: self._remove_slide(slide_name))
+        row_layout.addWidget(remove_btn)
+
+        # Insert before the stretch
+        self._content_layout.insertWidget(
+            self._content_layout.count() - 1, row
+        )
+        self._slide_rows[slide_name] = row
+
+        self.selection_changed.emit()
+
+    def _remove_slide(self, slide_name: str) -> None:
+        """Remove a slide from the list."""
+        row = self._slide_rows.pop(slide_name, None)
+        if row:
+            row.deleteLater()
+        self._slide_data.pop(slide_name, None)
+        self.slide_removed.emit(slide_name)
+        self.selection_changed.emit()
+
+    def clear(self) -> None:
+        """Remove all slides from the list."""
+        for row in self._slide_rows.values():
+            row.deleteLater()
+        self._slide_rows.clear()
+        self._slide_data.clear()
+        self.selection_changed.emit()
+
+    def get_slide_names(self) -> List[str]:
+        """Get list of slide names in the atlas."""
+        return list(self._slide_data.keys())
+
+    def get_slide_data(self, slide_name: str) -> Optional[Dict]:
+        """Get stored data for a slide."""
+        return self._slide_data.get(slide_name)
+
+    def get_all_slide_data(self) -> Dict[str, Dict]:
+        """Get all stored slide data."""
+        return self._slide_data.copy()
+
+    def count(self) -> int:
+        """Get number of slides in the list."""
+        return len(self._slide_data)
+
+
+class ThumbnailLoadTask(QObject, QRunnable):
+    """Background task for loading slide thumbnails."""
+
+    loaded = Signal(str, QImage)
+    failed = Signal(str, str)
+
+    def __init__(self, slide_name: str, image_path: str, max_size: int) -> None:
+        QObject.__init__(self)
+        QRunnable.__init__(self)
+        self._slide_name = slide_name
+        self._image_path = image_path
+        self._max_size = max_size
+
+    def run(self) -> None:
+        try:
+            image = data_loader.load_thumbnail(self._image_path, max_size=self._max_size)
+            qimage = QImage(ImageQt(image))
+            self.loaded.emit(self._slide_name, qimage)
+        except Exception as exc:
+            self.failed.emit(self._slide_name, str(exc))
+
+
+class SlideThumbnailItem(QFrame):
+    """Clickable slide thumbnail widget with loading and error states."""
+
+    clicked = Signal(str)
+
+    def __init__(self, slide_name: str, thumb_size: QSize, parent=None) -> None:
+        super().__init__(parent)
+        self._slide_name = slide_name
+        self._thumb_size = thumb_size
+        self._clickable = True
+
+        self.setFrameShape(QFrame.StyledPanel)
+        self.setStyleSheet(
+            "QFrame { border: 1px solid #cfcfcf; border-radius: 4px; }"
+        )
+        self.setCursor(Qt.PointingHandCursor)
+        self.setFixedWidth(self._thumb_size.width() + 16)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(6, 6, 6, 6)
+        layout.setSpacing(4)
+
+        self._thumb_container = QWidget()
+        self._thumb_container.setFixedSize(self._thumb_size)
+
+        self._stack = QStackedLayout(self._thumb_container)
+        self._stack.setContentsMargins(0, 0, 0, 0)
+
+        self._loading_bar = QProgressBar()
+        self._loading_bar.setRange(0, 0)
+        self._loading_bar.setTextVisible(False)
+        self._loading_bar.setFixedSize(self._thumb_size)
+        self._loading_bar.setStyleSheet("QProgressBar { border: none; }")
+
+        self._thumb_label = QLabel()
+        self._thumb_label.setAlignment(Qt.AlignCenter)
+        self._thumb_label.setFixedSize(self._thumb_size)
+        self._thumb_label.setStyleSheet("background-color: #202020;")
+
+        self._error_label = QLabel("Read Error")
+        self._error_label.setAlignment(Qt.AlignCenter)
+        self._error_label.setWordWrap(True)
+        self._error_label.setFixedSize(self._thumb_size)
+        self._error_label.setStyleSheet("color: #aa0000; font-size: 9px;")
+
+        self._stack.addWidget(self._loading_bar)
+        self._stack.addWidget(self._thumb_label)
+        self._stack.addWidget(self._error_label)
+        self._stack.setCurrentWidget(self._loading_bar)
+
+        layout.addWidget(self._thumb_container, alignment=Qt.AlignCenter)
+
+        self._name_label = QLabel()
+        self._name_label.setAlignment(Qt.AlignCenter)
+        self._name_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self._name_label.setStyleSheet("font-size: 9px;")
+        layout.addWidget(self._name_label)
+
+        self._update_name_label()
+
+    def mousePressEvent(self, event) -> None:
+        if self._clickable and event.button() == Qt.LeftButton:
+            self.clicked.emit(self._slide_name)
+        super().mousePressEvent(event)
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self._update_name_label()
+
+    def set_loading(self) -> None:
+        """Show loading indicator."""
+        self._stack.setCurrentWidget(self._loading_bar)
+        self._clickable = True
+        self.setCursor(Qt.PointingHandCursor)
+
+    def set_thumbnail(self, image: QImage) -> None:
+        """Set the thumbnail image for the slide."""
+        pixmap = QPixmap.fromImage(image)
+        pixmap = self._crop_pixmap(pixmap)
+        self._thumb_label.setPixmap(pixmap)
+        self._stack.setCurrentWidget(self._thumb_label)
+        self._clickable = True
+        self.setCursor(Qt.PointingHandCursor)
+
+    def set_error(self, message: str) -> None:
+        """Set error state when thumbnail fails to load."""
+        self._error_label.setToolTip(message)
+        self._stack.setCurrentWidget(self._error_label)
+        self._clickable = False
+        self.setCursor(Qt.ArrowCursor)
+
+    def set_selected(self, selected: bool) -> None:
+        """Highlight the selected slide."""
+        if selected:
+            self.setStyleSheet(
+                "QFrame { border: 2px solid #4a90e2; border-radius: 4px; }"
+            )
+        else:
+            self.setStyleSheet(
+                "QFrame { border: 1px solid #cfcfcf; border-radius: 4px; }"
+            )
+
+    def _update_name_label(self) -> None:
+        metrics = self._name_label.fontMetrics()
+        available_width = max(self._name_label.width() - 6, 20)
+        elided = metrics.elidedText(self._slide_name, Qt.ElideRight, available_width)
+        self._name_label.setText(elided)
+        self._name_label.setToolTip(self._slide_name)
+
+    def _crop_pixmap(self, pixmap: QPixmap) -> QPixmap:
+        target = self._thumb_size
+        scaled = pixmap.scaled(target, Qt.KeepAspectRatioByExpanding, Qt.SmoothTransformation)
+        x = max((scaled.width() - target.width()) // 2, 0)
+        y = max((scaled.height() - target.height()) // 2, 0)
+        return scaled.copy(x, y, target.width(), target.height())
+
+
+class SlideThumbnailListWidget(QWidget):
+    """Scrollable list of slide thumbnails with lazy loading."""
+
+    slide_selected = Signal(str)
+
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self._thumb_size = QSize(120, 80)
+        self._items: Dict[str, SlideThumbnailItem] = {}
+        self._slide_paths: Dict[str, str] = {}
+        self._tasks: Dict[str, ThumbnailLoadTask] = {}
+        self._thread_pool = QThreadPool()
+        self._thread_pool.setMaxThreadCount(2)
+        self._scroll_area: Optional[QScrollArea] = None
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+
+        header = QLabel("Slides")
+        header.setStyleSheet("font-weight: bold; padding: 4px 0;")
+        layout.addWidget(header)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        scroll.setFixedHeight(self._thumb_size.height() + 40)
+        self._scroll_area = scroll
+
+        self._content = QWidget()
+        self._content_layout = QHBoxLayout(self._content)
+        self._content_layout.setContentsMargins(0, 0, 0, 0)
+        self._content_layout.setSpacing(8)
+        self._content_layout.addStretch()
+
+        scroll.setWidget(self._content)
+        layout.addWidget(scroll)
+
+    def set_slides(self, slide_names: List[str], slide_infos: Dict[str, data_loader.SlideInfo]) -> None:
+        """Populate the thumbnail list with slides."""
+        self._clear_items()
+        self._slide_paths.clear()
+
+        for slide_name in slide_names:
+            info = slide_infos.get(slide_name)
+            image_path = info.image_path if info else ""
+            self._slide_paths[slide_name] = image_path
+
+            item = SlideThumbnailItem(slide_name, self._thumb_size)
+            item.clicked.connect(self.slide_selected.emit)
+            self._content_layout.insertWidget(self._content_layout.count() - 1, item)
+            self._items[slide_name] = item
+
+            if not image_path:
+                item.set_error("No image path available")
+                continue
+
+            item.set_loading()
+            self._start_thumbnail_load(slide_name, image_path)
+
+    def set_current_slide(self, slide_name: str) -> None:
+        """Highlight the currently selected slide."""
+        for name, item in self._items.items():
+            item.set_selected(name == slide_name)
+
+    def _clear_items(self) -> None:
+        for item in self._items.values():
+            item.deleteLater()
+        self._items.clear()
+        self._tasks.clear()
+
+    def _start_thumbnail_load(self, slide_name: str, image_path: str) -> None:
+        max_size = max(self._thumb_size.width(), self._thumb_size.height()) * 2
+        task = ThumbnailLoadTask(slide_name, image_path, max_size)
+        task.loaded.connect(self._on_thumbnail_loaded)
+        task.failed.connect(self._on_thumbnail_failed)
+        self._tasks[slide_name] = task
+        self._thread_pool.start(task)
+
+    def _on_thumbnail_loaded(self, slide_name: str, image: QImage) -> None:
+        item = self._items.get(slide_name)
+        if item is None:
+            return
+        item.set_thumbnail(image)
+        self._tasks.pop(slide_name, None)
+
+    def _on_thumbnail_failed(self, slide_name: str, message: str) -> None:
+        item = self._items.get(slide_name)
+        if item is None:
+            return
+        item.set_error(message)
+        self._tasks.pop(slide_name, None)
+
+
+class ModelSelectionDialog(QDialog):
+    """Dialog for selecting models, magnification, and patch size."""
+
+    def __init__(
+        self,
+        slide_info: data_loader.SlideInfo,
+        current_selection: Optional[ModelSelection] = None,
+        parent: Optional[QWidget] = None,
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Select Models")
+        self._slide_info = slide_info
+        self._current_selection = current_selection
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(10)
+
+        self._model_selector = ModelMultiSelector()
+        self._model_selector.addItems(sorted(slide_info.models.keys()))
+        self._model_selector.selectionChanged.connect(self._on_model_selection_changed)
+
+        self._mag_combo = QComboBox()
+        self._mag_combo.currentTextChanged.connect(self._on_mag_changed)
+
+        self._patch_combo = QComboBox()
+        self._patch_combo.currentTextChanged.connect(self._update_ok_state)
+
+        layout.addWidget(QLabel("Models:"))
+        layout.addWidget(self._model_selector)
+        layout.addWidget(QLabel("Magnification:"))
+        layout.addWidget(self._mag_combo)
+        layout.addWidget(QLabel("Patch size:"))
+        layout.addWidget(self._patch_combo)
+
+        self._buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        self._buttons.accepted.connect(self.accept)
+        self._buttons.rejected.connect(self.reject)
+        layout.addWidget(self._buttons)
+
+        if current_selection:
+            available_models = set(slide_info.models.keys())
+            preselect = [m for m in current_selection.models if m in available_models]
+            self._model_selector.setSelectedModels(preselect)
+
+        self._update_magnifications(prefer=current_selection.magnification if current_selection else None)
+        self._update_patches(prefer=current_selection.patch_size if current_selection else None)
+        self._update_ok_state()
+
+    def selection(self) -> Optional[ModelSelection]:
+        """Return the selected configuration if valid."""
+        models = self._model_selector.getSelectedModels()
+        mag = self._mag_combo.currentText()
+        patch = self._patch_combo.currentText()
+        if not models or not mag or not patch:
+            return None
+        return ModelSelection(models=models, magnification=mag, patch_size=patch)
+
+    def _on_model_selection_changed(self) -> None:
+        self._update_magnifications()
+        self._update_patches()
+        self._update_ok_state()
+
+    def _on_mag_changed(self, mag: str) -> None:
+        self._update_patches()
+        self._update_ok_state()
+
+    def _update_magnifications(self, prefer: Optional[str] = None) -> None:
+        models = self._model_selector.getSelectedModels()
+        mags = self._get_common_magnifications(models)
+        self._mag_combo.blockSignals(True)
+        self._mag_combo.clear()
+        self._mag_combo.addItems(mags)
+        if prefer and prefer in mags:
+            self._mag_combo.setCurrentText(prefer)
+        self._mag_combo.blockSignals(False)
+
+    def _update_patches(self, prefer: Optional[str] = None) -> None:
+        models = self._model_selector.getSelectedModels()
+        mag = self._mag_combo.currentText()
+        patches = self._get_common_patches(models, mag)
+        self._patch_combo.blockSignals(True)
+        self._patch_combo.clear()
+        self._patch_combo.addItems(patches)
+        if prefer and prefer in patches:
+            self._patch_combo.setCurrentText(prefer)
+        self._patch_combo.blockSignals(False)
+
+    def _update_ok_state(self) -> None:
+        selection = self.selection()
+        self._buttons.button(QDialogButtonBox.Ok).setEnabled(selection is not None)
+
+    def _get_common_magnifications(self, models: List[str]) -> List[str]:
+        mag_sets = []
+        for model_name in models:
+            model_dict = self._slide_info.models.get(model_name, {})
+            mag_sets.append(set(model_dict.keys()))
+        if not mag_sets:
+            return []
+        return sorted(set.intersection(*mag_sets))
+
+    def _get_common_patches(self, models: List[str], mag: str) -> List[str]:
+        if not models or not mag:
+            return []
+        patch_sets = []
+        for model_name in models:
+            patches = self._slide_info.models.get(model_name, {}).get(mag, {})
+            patch_sets.append(set(patches.keys()))
+        if not patch_sets:
+            return []
+        return sorted(set.intersection(*patch_sets))
 
 
 class MainWindow(QMainWindow):
@@ -1341,6 +1897,8 @@ class MainWindow(QMainWindow):
         self._hovered_scatter_idx: Optional[int] = None
         # Track selected clusters for persistent opacity reduction
         self._selected_clusters: set[int] = set()
+        # Toast for preview-only interactions
+        self._preview_toast: Optional[QLabel] = None
         # Store level-0 coordinates for GeoJSON export
         self._current_coords_lv0: Optional[np.ndarray] = None
         self._current_patch_size_lv0: Optional[float] = None
@@ -1349,6 +1907,8 @@ class MainWindow(QMainWindow):
         self._cluster_centroids: Optional[np.ndarray] = None
         self._max_cluster_distances: Optional[np.ndarray] = None
         self._current_labels: Optional[np.ndarray] = None
+        # Persisted model selection for session
+        self._model_selection: Optional[ModelSelection] = None
         # Track cascade animation state to prevent hover interference
         self._animation_in_progress: bool = False
         # Local region selection mode state
@@ -1356,6 +1916,8 @@ class MainWindow(QMainWindow):
         self._local_region_clusters: Dict[int, LocalRegionCluster] = {}
         self._next_local_cluster_id: int = 0
         self._local_region_radius: float = 50.0
+        self._update_model_selection_label()
+        self._set_model_dependent_ui_enabled(False)
 
     def _create_widgets(self) -> None:
         """Create and lay out widgets for the main window."""
@@ -1369,29 +1931,38 @@ class MainWindow(QMainWindow):
         # Folder selection row (button removed - now in File menu)
         folder_row = QHBoxLayout()
         self.root_label = QLabel("No folder selected")
+        self.root_label.setWordWrap(True)
+        self.root_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
         folder_row.addWidget(self.root_label)
         main_vbox.addLayout(folder_row)
         
-        # Drop‑down row
-        dropdown_row = QHBoxLayout()
+        # Slide thumbnail selection list
         self.slide_combo = QComboBox()
         self.slide_combo.setPlaceholderText("Select slide")
-        dropdown_row.addWidget(QLabel("Slide:"))
-        dropdown_row.addWidget(self.slide_combo)
-        
-        # Model multi-selector dropdown
+        self.slide_combo.setVisible(False)
+
+        self.slide_thumbnail_list = SlideThumbnailListWidget()
+        self.slide_thumbnail_list.slide_selected.connect(self._on_thumbnail_slide_selected)
+        main_vbox.addWidget(self.slide_thumbnail_list)
+
+        # Model selection controls (popup)
         self.model_selector = ModelMultiSelector()
-        dropdown_row.addWidget(QLabel("Models:"))
-        dropdown_row.addWidget(self.model_selector)
-        
+        self.model_selector.setVisible(False)
         self.mag_combo = QComboBox()
-        dropdown_row.addWidget(QLabel("Magnification:"))
-        dropdown_row.addWidget(self.mag_combo)
+        self.mag_combo.setVisible(False)
         self.patch_combo = QComboBox()
-        dropdown_row.addWidget(QLabel("Patch size:"))
-        dropdown_row.addWidget(self.patch_combo)
-        main_vbox.addLayout(dropdown_row)
-        
+        self.patch_combo.setVisible(False)
+
+        model_row = QHBoxLayout()
+        self.model_select_btn = QPushButton("Select Model...")
+        self.model_select_btn.setEnabled(False)
+        self.model_selection_label = QLabel("No model selected")
+        self.model_selection_label.setWordWrap(True)
+        self.model_selection_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        model_row.addWidget(self.model_select_btn)
+        model_row.addWidget(self.model_selection_label, stretch=1)
+        main_vbox.addLayout(model_row)
+
         # Clusters control
         cluster_row = QHBoxLayout()
         self.cluster_spin = QSpinBox()
@@ -1411,15 +1982,13 @@ class MainWindow(QMainWindow):
         self.status_label = QLabel("")
         self.status_label.setStyleSheet("color: gray; font-size: 9pt;")
         self.status_label.setWordWrap(True)
+        self.status_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
         main_vbox.addWidget(self.status_label)
         
-        # Horizontal layout for legend + info panel + slide view
-        content_layout = QHBoxLayout()
-
-        # Left sidebar: tabbed widget with K-means clusters and Local Region selection
+        # Splitter for sidebar + slide view
         self.sidebar_tabs = QTabWidget()
-        self.sidebar_tabs.setMinimumWidth(170)
-        self.sidebar_tabs.setMaximumWidth(220)
+        self.sidebar_tabs.setMinimumWidth(160)
+        self.sidebar_tabs.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
 
         # Tab 1: K-means Clusters (existing ClusterLegendWidget)
         kmeans_tab = QWidget()
@@ -1453,11 +2022,62 @@ class MainWindow(QMainWindow):
         self.local_region_widget.clear_all_requested.connect(self._clear_local_region_clusters)
         self.local_region_widget.export_requested.connect(self._export_local_region_clusters)
 
+        # Tab 3: Cross-Slide Atlas
+        atlas_tab = QWidget()
+        atlas_layout = QVBoxLayout(atlas_tab)
+        atlas_layout.setContentsMargins(5, 5, 5, 5)
+        atlas_layout.setSpacing(8)
+
+        # Atlas slide selection list
+        atlas_layout.addWidget(QLabel("Slides for Atlas:"))
+        self.atlas_slide_list = AtlasSlideListWidget()
+        self.atlas_slide_list.setMinimumHeight(120)
+        atlas_layout.addWidget(self.atlas_slide_list)
+
+        # Add current slide button
+        self.atlas_add_current_btn = QPushButton("Add Current Slide")
+        self.atlas_add_current_btn.clicked.connect(self._on_atlas_add_current)
+        atlas_layout.addWidget(self.atlas_add_current_btn)
+
+        # Cluster count control
+        atlas_k_row = QHBoxLayout()
+        atlas_k_row.addWidget(QLabel("Clusters:"))
+        self.atlas_k_spin = QSpinBox()
+        self.atlas_k_spin.setRange(2, 50)
+        self.atlas_k_spin.setValue(10)
+        atlas_k_row.addWidget(self.atlas_k_spin)
+        atlas_k_row.addStretch()
+        atlas_layout.addLayout(atlas_k_row)
+
+        # Build atlas button
+        self.build_atlas_btn = QPushButton("Build Atlas")
+        self.build_atlas_btn.clicked.connect(self._build_atlas)
+        self.build_atlas_btn.setEnabled(False)
+        atlas_layout.addWidget(self.build_atlas_btn)
+
+        # Clear atlas button
+        self.clear_atlas_btn = QPushButton("Clear Atlas")
+        self.clear_atlas_btn.clicked.connect(self._clear_atlas)
+        self.clear_atlas_btn.setEnabled(False)
+        atlas_layout.addWidget(self.clear_atlas_btn)
+
+        # Atlas progress bar
+        self.atlas_progress = QProgressBar()
+        self.atlas_progress.setVisible(False)
+        atlas_layout.addWidget(self.atlas_progress)
+
+        # Atlas info label
+        self.atlas_info_label = QLabel("Add at least 2 slides to build atlas")
+        self.atlas_info_label.setWordWrap(True)
+        self.atlas_info_label.setStyleSheet("color: gray; font-size: 10px;")
+        atlas_layout.addWidget(self.atlas_info_label)
+
+        atlas_layout.addStretch()
+        self.sidebar_tabs.addTab(atlas_tab, "Atlas")
+
         # Connect tab change to mode switch
         self.sidebar_tabs.currentChanged.connect(self._on_sidebar_tab_changed)
 
-        content_layout.addWidget(self.sidebar_tabs)
-        
         # Main slide view (takes remaining width)
         self.graphics_view = SlideGraphicsView()
         self.graphics_view.setMinimumWidth(400)
@@ -1467,14 +2087,22 @@ class MainWindow(QMainWindow):
         )
         # Connect slide hover to scatter
         self.graphics_view.patch_hovered.connect(self._on_slide_patch_hovered)
+        self.graphics_view.preview_action_attempted.connect(self._show_preview_blocked_toast)
         # Connect slide animation signals for synchronized scatter cascade
         self.graphics_view.patches_highlighted.connect(self._on_patches_highlighted)
         self.graphics_view.animation_completed.connect(self._on_animation_completed)
         # Connect local region selection signal
         self.graphics_view.local_region_selected.connect(self._on_local_region_selected)
-        content_layout.addWidget(self.graphics_view, stretch=1)
-        
-        main_vbox.addLayout(content_layout, stretch=1)
+
+        splitter = QSplitter(Qt.Horizontal)
+        splitter.addWidget(self.sidebar_tabs)
+        splitter.addWidget(self.graphics_view)
+        splitter.setStretchFactor(0, 0)
+        splitter.setStretchFactor(1, 1)
+        splitter.setCollapsible(0, False)
+        splitter.setCollapsible(1, False)
+
+        main_vbox.addWidget(splitter, stretch=1)
         
         # Scatter plot view in floating dock widget
         self.scatter_view = ScatterGraphicsView()
@@ -1512,6 +2140,42 @@ class MainWindow(QMainWindow):
         
         # Connect dock visibility changed signal for snapping
         self.scatter_dock.visibilityChanged.connect(self._on_scatter_dock_visibility_changed)
+
+        # Atlas scatter view in separate dock widget
+        self.atlas_scatter_view = AtlasScatterView()
+        self.atlas_scatter_view.setMinimumSize(300, 300)
+        # Connect atlas scatter signals
+        self.atlas_scatter_view.cluster_selected.connect(self._on_atlas_cluster_selected)
+        self.atlas_scatter_view.point_hovered.connect(self._on_atlas_point_hovered)
+
+        # Create dock widget for atlas scatter view
+        self.atlas_scatter_dock = QDockWidget("Atlas Embedding View", self)
+        self.atlas_scatter_dock.setWidget(self.atlas_scatter_view)
+        self.atlas_scatter_dock.setAllowedAreas(Qt.AllDockWidgetAreas)
+        self.atlas_scatter_dock.setFeatures(
+            QDockWidget.DockWidgetMovable |
+            QDockWidget.DockWidgetFloatable |
+            QDockWidget.DockWidgetClosable
+        )
+        # Add to main window but start hidden
+        self.addDockWidget(Qt.RightDockWidgetArea, self.atlas_scatter_dock)
+        self.atlas_scatter_dock.setFloating(True)
+        self.atlas_scatter_dock.resize(400, 400)
+        self.atlas_scatter_dock.hide()  # Hidden until atlas is built
+
+        # Add atlas dock toggle to View menu
+        self.atlas_scatter_dock_action = self.atlas_scatter_dock.toggleViewAction()
+        self.atlas_scatter_dock_action.setText("Show Atlas Embedding View")
+        self.atlas_scatter_dock_action.setShortcut("Ctrl+4")
+        self._view_menu.addAction(self.atlas_scatter_dock_action)
+
+        # Initialize atlas-related state
+        self._cluster_atlas: Optional[ClusterAtlas] = None
+        self._atlas_builder: Optional[AtlasBuilder] = None
+
+        # Connect atlas slide list signals
+        self.atlas_slide_list.slide_removed.connect(self._on_atlas_slide_removed)
+        self.atlas_slide_list.selection_changed.connect(self._update_atlas_ui_state)
 
         # Hover popup for scatter patch info
         self.patch_info_popup = PatchInfoPopup()
@@ -1597,6 +2261,7 @@ class MainWindow(QMainWindow):
     def _connect_signals(self) -> None:
         """Connect signals and slots for interactive widgets."""
         self.slide_combo.currentTextChanged.connect(self._on_slide_changed)
+        self.model_select_btn.clicked.connect(self._open_model_selection_dialog)
         self.model_selector.selectionChanged.connect(self._on_model_selection_changed)
         self.mag_combo.currentTextChanged.connect(self._on_mag_changed)
         self.patch_combo.currentTextChanged.connect(self._on_patch_changed)
@@ -1623,40 +2288,314 @@ class MainWindow(QMainWindow):
             slide_names = sorted(self.slides.keys())
             print(f"DEBUG: Adding slides to combo box: {slide_names}")
             self.slide_combo.addItems(slide_names)
+            self.slide_thumbnail_list.set_slides(slide_names, self.slides)
             
             # Clear subsequent selectors and view
+            self._model_selection = None
+            self._update_model_selection_label()
+            self._set_model_dependent_ui_enabled(False)
+            self.model_select_btn.setEnabled(bool(slide_names))
             self.model_selector.clear()
             self.mag_combo.clear()
             self.patch_combo.clear()
             self.graphics_view.scene().clear()
             if hasattr(self.graphics_view, 'rect_items'):
                 self.graphics_view.rect_items.clear()
+            self._clear_scatter_view()
             
         except Exception as e:
             print(f"DEBUG: Error parsing directory: {str(e)}")
             QMessageBox.critical(self, "Error", f"Failed to parse folder:\n{str(e)}")
             return
 
-    def _on_slide_changed(self, slide_name: str) -> None:
-        """Update model selector and mag/patch combos when a new slide is selected."""
-        print(f"DEBUG: Slide changed to: {slide_name}")
+    def _on_thumbnail_slide_selected(self, slide_name: str) -> None:
+        """Handle selection from the thumbnail list."""
+        if slide_name and slide_name != self.slide_combo.currentText():
+            self.slide_combo.setCurrentText(slide_name)
+
+    def _open_model_selection_dialog(self) -> None:
+        """Open the model selection dialog for the current slide."""
+        slide_name = self.slide_combo.currentText()
         if not slide_name:
-            print("DEBUG: No slide name provided")
+            QMessageBox.warning(self, "Select Slide", "Please select a slide first.")
             return
         info = self.slides.get(slide_name)
         if info is None:
-            print(f"DEBUG: No slide info found for {slide_name}")
+            QMessageBox.warning(self, "Select Slide", "Slide information is unavailable.")
             return
-        
-        print(f"DEBUG: Found slide info: {info}")
-        # Populate model selector
-        self.model_selector.clear()
+
+        dialog = ModelSelectionDialog(info, self._model_selection, self)
+        if dialog.exec():
+            selection = dialog.selection()
+            if selection is None:
+                QMessageBox.warning(self, "Model Selection", "Select models, magnification, and patch size.")
+                return
+            self._model_selection = selection
+            if not self._apply_model_selection(selection):
+                self._model_selection = None
+                self._update_model_selection_label()
+                self._set_model_dependent_ui_enabled(False)
+                return
+            self._update_model_selection_label()
+            self._set_model_dependent_ui_enabled(True)
+            self._load_current_data()
+
+    def _on_slide_changed(self, slide_name: str) -> None:
+        """Load slide preview and apply any active model selection."""
+        print(f"DEBUG: Slide changed to: {slide_name}")
+        if not slide_name:
+            print("DEBUG: No slide name provided")
+            self.model_select_btn.setEnabled(False)
+            return
+        self.slide_thumbnail_list.set_current_slide(slide_name)
+        info = self.slides.get(slide_name)
+        if info is None:
+            print(f"DEBUG: No slide info found for {slide_name}")
+            self.model_select_btn.setEnabled(False)
+            return
+
+        self.model_select_btn.setEnabled(True)
+        self._load_slide_image_only(slide_name)
+
+        if self._model_selection:
+            if self._apply_model_selection(self._model_selection):
+                self._set_model_dependent_ui_enabled(True)
+                self._load_current_data()
+            else:
+                self._model_selection = None
+                self._update_model_selection_label()
+                self._set_model_dependent_ui_enabled(False)
+        else:
+            self._set_model_dependent_ui_enabled(False)
+
+    def _populate_model_selector(self, info: data_loader.SlideInfo) -> None:
+        """Populate the hidden model selector for the current slide."""
         model_names = sorted(info.models.keys())
-        print(f"DEBUG: Adding models to selector: {model_names}")
+        self.model_selector.blockSignals(True)
+        self.model_selector.clear()
         self.model_selector.addItems(model_names)
-        
+        self.model_selector.blockSignals(False)
+
+    def _apply_model_selection(self, selection: ModelSelection) -> bool:
+        """Apply a stored model selection to the current slide."""
+        slide_name = self.slide_combo.currentText()
+        if not slide_name:
+            return False
+        info = self.slides.get(slide_name)
+        if info is None:
+            return False
+
+        self._populate_model_selector(info)
+        available_models = set(info.models.keys())
+        missing = [model for model in selection.models if model not in available_models]
+        if missing:
+            QMessageBox.warning(
+                self,
+                "Models Unavailable",
+                f"Selected models not available for {slide_name}: {', '.join(missing)}",
+            )
+            return False
+
+        magnifications = self._get_common_magnifications(selection.models, info)
+        if selection.magnification not in magnifications:
+            QMessageBox.warning(
+                self,
+                "Magnification Unavailable",
+                f"Magnification {selection.magnification} not available for selected models.",
+            )
+            return False
+
+        patches = self._get_common_patches(selection.models, selection.magnification, info)
+        if selection.patch_size not in patches:
+            QMessageBox.warning(
+                self,
+                "Patch Size Unavailable",
+                f"Patch size {selection.patch_size} not available for selected models.",
+            )
+            return False
+
+        self.model_selector.blockSignals(True)
+        self.model_selector.setSelectedModels(selection.models)
+        self.model_selector.blockSignals(False)
+
+        self.mag_combo.blockSignals(True)
         self.mag_combo.clear()
+        self.mag_combo.addItems(magnifications)
+        self.mag_combo.setCurrentText(selection.magnification)
+        self.mag_combo.blockSignals(False)
+
+        self.patch_combo.blockSignals(True)
         self.patch_combo.clear()
+        self.patch_combo.addItems(patches)
+        self.patch_combo.setCurrentText(selection.patch_size)
+        self.patch_combo.blockSignals(False)
+
+        self._update_model_selection_label()
+        return True
+
+    def _get_common_magnifications(
+        self,
+        models: List[str],
+        info: data_loader.SlideInfo,
+    ) -> List[str]:
+        mag_sets = []
+        for model_name in models:
+            model_dict = info.models.get(model_name, {})
+            mag_sets.append(set(model_dict.keys()))
+        if not mag_sets:
+            return []
+        return sorted(set.intersection(*mag_sets))
+
+    def _get_common_patches(
+        self,
+        models: List[str],
+        magnification: str,
+        info: data_loader.SlideInfo,
+    ) -> List[str]:
+        if not models or not magnification:
+            return []
+        patch_sets = []
+        for model_name in models:
+            patches = info.models.get(model_name, {}).get(magnification, {})
+            patch_sets.append(set(patches.keys()))
+        if not patch_sets:
+            return []
+        return sorted(set.intersection(*patch_sets))
+
+    def _update_model_selection_label(self) -> None:
+        """Update the summary label for the current model selection."""
+        if self._model_selection is None:
+            self.model_selection_label.setText("No model selected")
+            self.model_selection_label.setToolTip("No model selected")
+            return
+        model_str = ", ".join(self._model_selection.models)
+        summary = (
+            f"Model: {model_str} | "
+            f"{self._model_selection.magnification} | "
+            f"{self._model_selection.patch_size}"
+        )
+        self.model_selection_label.setText(summary)
+        self.model_selection_label.setToolTip(summary)
+
+    def _set_model_dependent_ui_enabled(self, enabled: bool) -> None:
+        """Enable or disable model-dependent UI elements."""
+        self.cluster_legend.setEnabled(enabled)
+        self.local_region_widget.setEnabled(enabled)
+        self.scatter_view.setEnabled(enabled)
+        self.atlas_add_current_btn.setEnabled(enabled)
+        self.cluster_spin.setEnabled(enabled)
+        self.export_action.setEnabled(enabled and bool(self._selected_clusters))
+
+    def _clear_scatter_view(self) -> None:
+        """Clear scatter view contents when no model is selected."""
+        self.scatter_view.scene().clear()
+        self.scatter_view._scatter_items.clear()
+        self.scatter_view.labels = None
+        self.scatter_view.cluster_colors = []
+        self.scatter_view.set_animation_active(False)
+
+    def _show_preview_blocked_toast(self) -> None:
+        """Show a short-lived toast when preview interactions are blocked."""
+        if self._model_selection is not None:
+            return
+
+        if self._preview_toast is None:
+            self._preview_toast = QLabel(self)
+            self._preview_toast.setStyleSheet(
+                "QLabel {"
+                "background-color: rgba(30, 30, 30, 200);"
+                "color: white;"
+                "padding: 6px 10px;"
+                "border-radius: 6px;"
+                "font-size: 10pt;"
+                "}"
+            )
+        self._preview_toast.setText("No model selected")
+        self._preview_toast.adjustSize()
+
+        cursor_pos = QCursor.pos()
+        toast_pos = cursor_pos + QPoint(12, 12)
+        self._preview_toast.move(toast_pos)
+        self._preview_toast.show()
+        self._preview_toast.raise_()
+
+        QTimer.singleShot(2000, self._preview_toast.hide)
+
+    def _load_slide_image_only(self, slide_name: str) -> None:
+        """Load a slide preview without clustering."""
+        info = self.slides.get(slide_name)
+        if info is None:
+            return
+
+        self.progress_bar.setVisible(True)
+        QApplication.processEvents()
+
+        adaptive_enabled = self.adaptive_zoom_action.isChecked()
+        self.graphics_view.set_adaptive_mode(adaptive_enabled)
+        use_adaptive = adaptive_enabled and data_loader.is_openslide_available()
+
+        if use_adaptive:
+            try:
+                from openslide import OpenSlide  # type: ignore
+
+                slide = OpenSlide(info.image_path)
+                slide_dimensions = slide.dimensions
+                slide.close()
+                empty_coords = np.zeros((0, 2), dtype=float)
+                empty_labels = np.zeros((0,), dtype=int)
+                adaptive_loaded = self.graphics_view.load_slide_adaptive(
+                    info.image_path,
+                    empty_coords,
+                    0.0,
+                    empty_labels,
+                    [],
+                    slide_dimensions,
+                )
+                if adaptive_loaded:
+                    self.cluster_legend.clear_cluster_names()
+                    self.cluster_legend.update_clusters(np.zeros((0,), dtype=int), [])
+                    self._clear_scatter_view()
+                    self._current_embedding = None
+                    self._current_features = None
+                    self._current_coords_thumb = None
+                    self._current_coords_lv0 = None
+                    self._current_patch_size_thumb = None
+                    self._current_patch_size_lv0 = None
+                    self._coord_scale_factor = None
+                    self._current_labels = None
+                    self._clear_selected_clusters()
+                    self.progress_bar.setVisible(False)
+                    self.status_label.setText("Preview only — select a model to enable clustering.")
+                    return
+            except Exception as exc:
+                print(f"DEBUG: Adaptive preview failed: {exc}")
+
+        try:
+            thumb_image = data_loader.load_thumbnail(info.image_path)
+        except Exception as exc:
+            self.progress_bar.setVisible(False)
+            QMessageBox.critical(self, "Error", f"Failed to load slide thumbnail:\n{exc}")
+            return
+
+        empty_coords = np.zeros((0, 2), dtype=float)
+        empty_labels = np.zeros((0,), dtype=int)
+        self.graphics_view.load_slide(thumb_image, empty_coords, 0.0, empty_labels, [])
+        self.cluster_legend.clear_cluster_names()
+        self.cluster_legend.update_clusters(empty_labels, [])
+        self._clear_scatter_view()
+
+        self._current_embedding = None
+        self._current_features = None
+        self._current_coords_thumb = None
+        self._current_coords_lv0 = None
+        self._current_patch_size_thumb = None
+        self._current_patch_size_lv0 = None
+        self._coord_scale_factor = None
+        self._current_labels = None
+        self._clear_selected_clusters()
+        self.status_label.setText("Select a model to enable clustering.")
+
+        self.progress_bar.setVisible(False)
 
     def _on_model_selection_changed(self) -> None:
         """Update magnification combo when model selection changes."""
@@ -1710,6 +2649,8 @@ class MainWindow(QMainWindow):
 
     def _on_mag_changed(self, mag: str) -> None:
         """Update patch combo when magnification changes."""
+        if self._model_selection is None:
+            return
         slide_name = self.slide_combo.currentText()
         selected_models = self.model_selector.getSelectedModels()
         if not slide_name or not selected_models or not mag:
@@ -1740,12 +2681,16 @@ class MainWindow(QMainWindow):
 
     def _on_patch_changed(self, patch: str) -> None:
         """Load new data when patch size changes."""
+        if self._model_selection is None:
+            return
         # Validate model compatibility before loading
         self._validate_model_compatibility()
         self._load_current_data()
 
     def _on_cluster_changed(self, k: int) -> None:
         """Recompute clusters when the cluster count slider changes."""
+        if self._model_selection is None:
+            return
         print(f"DEBUG: Cluster spin changed to {k}; reclustering current features")
         self._load_current_data(recluster_only=True)
 
@@ -1762,7 +2707,10 @@ class MainWindow(QMainWindow):
         self.graphics_view.set_adaptive_mode(checked)
         # Reload the current slide in the new mode
         if self.slide_combo.currentText():
-            self._load_current_data()
+            if self._model_selection is None:
+                self._load_slide_image_only(self.slide_combo.currentText())
+            else:
+                self._load_current_data()
 
     def _on_slide_patch_hovered(self, idx: int, state: bool) -> None:
         """Highlight the scatter point corresponding to the hovered slide patch."""
@@ -2584,6 +3532,9 @@ class MainWindow(QMainWindow):
     # --- persistent cluster styling ---
     def _update_export_action(self) -> None:
         """Enable or disable export based on selection state."""
+        if self._model_selection is None:
+            self.export_action.setEnabled(False)
+            return
         self.export_action.setEnabled(bool(self._selected_clusters))
 
     def _set_selected_clusters(self, clusters: set[int]) -> None:
@@ -2669,6 +3620,10 @@ class MainWindow(QMainWindow):
         if self.scatter_view:
             self.scatter_view.set_animation_active(False)
         
+        if self._model_selection is None:
+            print("DEBUG: No model selection; skipping data load")
+            return
+
         slide_name = self.slide_combo.currentText()
         selected_models = self._get_selected_models()
         mag = self.mag_combo.currentText()
@@ -3433,6 +4388,65 @@ class MainWindow(QMainWindow):
             selected_indices, slide_click_point, slide_radius, kmeans_cluster
         )
 
+    def _compute_local_region_center(self, patch_indices: Set[int]) -> Tuple[float, float]:
+        """Compute the center point for a local region based on patches."""
+        if not patch_indices or self.graphics_view.coords is None:
+            return (0.0, 0.0)
+        patch_centers = (
+            self.graphics_view.coords[list(patch_indices)]
+            + self.graphics_view.patch_size / 2.0
+        )
+        return (float(patch_centers[:, 0].mean()), float(patch_centers[:, 1].mean()))
+
+    def _regions_are_connected(self, left: Set[int], right: Set[int]) -> bool:
+        """Return True if two regions are connected by adjacent patches."""
+        if self.graphics_view.coords is None or not left or not right:
+            return False
+
+        coords = self.graphics_view.coords
+        step = int(round(self.graphics_view.patch_size))
+        if step <= 0:
+            step = 1
+
+        left_coords = coords[list(left)]
+        left_keys = {
+            (int(round(x)), int(round(y)))
+            for x, y in left_coords
+        }
+
+        right_coords = coords[list(right)]
+        for x, y in right_coords:
+            key = (int(round(x)), int(round(y)))
+            if key in left_keys:
+                return True
+            for dx, dy in ((step, 0), (-step, 0), (0, step), (0, -step)):
+                if (key[0] + dx, key[1] + dy) in left_keys:
+                    return True
+
+        return False
+
+    def _find_connected_local_regions(
+        self, patch_indices: Set[int], kmeans_cluster: int
+    ) -> List[int]:
+        """Find existing region IDs connected to the new selection."""
+        connected_ids: List[int] = []
+        merged_indices = set(patch_indices)
+        changed = True
+
+        while changed:
+            changed = False
+            for region_id, cluster in list(self._local_region_clusters.items()):
+                if cluster.kmeans_cluster != kmeans_cluster:
+                    continue
+                if region_id in connected_ids:
+                    continue
+                if self._regions_are_connected(cluster.patch_indices, merged_indices):
+                    connected_ids.append(region_id)
+                    merged_indices.update(cluster.patch_indices)
+                    changed = True
+
+        return connected_ids
+
     def _create_local_region_cluster(self, patch_indices: Set[int],
                                       center_point: Tuple[float, float],
                                       radius: float, kmeans_cluster: int) -> None:
@@ -3449,6 +4463,71 @@ class MainWindow(QMainWindow):
         kmeans_cluster : int
             The K-means cluster this region belongs to.
         """
+        connected_ids = self._find_connected_local_regions(patch_indices, kmeans_cluster)
+        if connected_ids:
+            primary_id = connected_ids[0]
+            merged_indices = set(patch_indices)
+            merged_radius = radius
+
+            for region_id in connected_ids:
+                cluster = self._local_region_clusters.get(region_id)
+                if cluster is None:
+                    continue
+                merged_indices.update(cluster.patch_indices)
+                merged_radius = max(merged_radius, cluster.radius)
+
+            primary_cluster = self._local_region_clusters.get(primary_id)
+            if primary_cluster is None:
+                return
+
+            primary_cluster.patch_indices = merged_indices
+            primary_cluster.center_point = self._compute_local_region_center(merged_indices)
+            primary_cluster.radius = merged_radius
+
+            self.local_region_widget.update_region(
+                primary_id, len(merged_indices), primary_cluster.name
+            )
+
+            # Reapply styles to ensure all regions have correct opacities before cascade
+            self._apply_local_region_cluster_styles()
+
+            print(
+                f"DEBUG: Merged local regions into {primary_id} with "
+                f"{len(merged_indices)} patches"
+            )
+
+            # Collect all other region indices before deleting merged ones
+            all_other_indices = set()
+            for region_id, cluster in self._local_region_clusters.items():
+                if region_id not in set(connected_ids) | {primary_id}:
+                    all_other_indices.update(cluster.patch_indices)
+
+            new_indices = set(patch_indices)
+            for region_id in connected_ids:
+                if region_id == primary_id:
+                    continue
+                cluster = self._local_region_clusters.get(region_id)
+                if cluster is None:
+                    continue
+                new_indices -= cluster.patch_indices
+
+            if new_indices:
+                self._trigger_local_region_cascade(
+                    primary_id, center_point, animate_indices=new_indices, preserve_indices=all_other_indices
+                )
+            else:
+                self._apply_local_region_cluster_styles()
+
+            # Now delete the merged regions
+            for region_id in connected_ids:
+                if region_id == primary_id:
+                    continue
+                if region_id in self._local_region_clusters:
+                    del self._local_region_clusters[region_id]
+                self.local_region_widget.remove_region(region_id)
+
+            return
+
         cluster_id = self._next_local_cluster_id
         self._next_local_cluster_id += 1
 
@@ -3480,7 +4559,13 @@ class MainWindow(QMainWindow):
         # Trigger cascade animation for the new cluster
         self._trigger_local_region_cascade(cluster_id, center_point)
 
-    def _trigger_local_region_cascade(self, cluster_id: int, click_point: Tuple[float, float]) -> None:
+    def _trigger_local_region_cascade(
+        self,
+        cluster_id: int,
+        click_point: Tuple[float, float],
+        animate_indices: Optional[Set[int]] = None,
+        preserve_indices: Optional[Set[int]] = None,
+    ) -> None:
         """Trigger cascade animation for a local region cluster.
 
         Parameters
@@ -3498,23 +4583,49 @@ class MainWindow(QMainWindow):
         if not indices:
             return
 
+        if animate_indices is None:
+            animate_indices = set(indices)
+        else:
+            animate_indices = set(animate_indices)
+
+        if not animate_indices:
+            self._apply_local_region_cluster_styles()
+            return
+
         # Get coordinates for radial ordering
         patch_centers = self.graphics_view.coords + self.graphics_view.patch_size / 2.0
-        cluster_coords = patch_centers[indices]
+        animate_list = [idx for idx in indices if idx in animate_indices]
+        if not animate_list:
+            self._apply_local_region_cluster_styles()
+            return
+        cluster_coords = patch_centers[animate_list]
 
         # Order by distance from click point
         order_local = radial_sweep_order(cluster_coords, click_point)
-        order_global = [indices[i] for i in order_local]
+        order_global = [animate_list[i] for i in order_local]
 
-        # Set patches to cluster color and dim before animation
-        for idx in indices:
+        # Build full set of local-region indices (all regions)
+        all_local_indices = set()
+        for cid, cl in self._local_region_clusters.items():
+            all_local_indices.update(cl.patch_indices)
+
+        # Use provided preserve_indices or fallback to all other regions
+        preserve_indices = preserve_indices or set()
+        if not preserve_indices:
+            for region_id, other_cluster in self._local_region_clusters.items():
+                if region_id == cluster_id:
+                    continue
+                preserve_indices.update(other_cluster.patch_indices)
+
+        # Set patches to cluster color and dim before animation (only animated indices)
+        for idx in animate_list:
             rect = self.graphics_view.rect_items[idx]
             rect.setBrush(QBrush(cluster.color))
             rect.setOpacity(self.graphics_view.highlight_opacity_off)
 
-        # Dim all other patches
+        # Dim only patches not in any local region
         for i, rect in enumerate(self.graphics_view.rect_items):
-            if i not in cluster.patch_indices:
+            if i not in all_local_indices:
                 rect.setOpacity(0.0)
 
         # Prepare scatter view
@@ -3539,12 +4650,10 @@ class MainWindow(QMainWindow):
         if not cluster:
             return
 
-        # Dim all scatter points
+        # Dim only the selected cluster points; leave others as-is
         for item in self.scatter_view._scatter_items:
             if item.index in cluster.patch_indices:
                 item.setOpacity(0.2)  # Will be animated to 1.0
-            else:
-                item.setOpacity(0.1)  # Very dim for non-selected
 
     def _on_local_region_clicked(self, region_id: int) -> None:
         """Handle click on a local region in the widget list.
@@ -3716,3 +4825,231 @@ class MainWindow(QMainWindow):
             "Export Complete",
             f"Exported {len(features)} local regions to:\n{file_path}"
         )
+
+    # -------------------------------------------------------------------------
+    # Cross-Slide Atlas Methods
+    # -------------------------------------------------------------------------
+
+    def _on_atlas_add_current(self) -> None:
+        """Add the currently loaded slide to the atlas builder."""
+        if self._current_features is None:
+            QMessageBox.warning(
+                self, "No Slide Loaded",
+                "Please load a slide first before adding it to the atlas."
+            )
+            return
+
+        slide_name = self.slide_combo.currentText()
+        if not slide_name:
+            return
+
+        # Check if already added
+        if slide_name in self.atlas_slide_list.get_slide_names():
+            QMessageBox.information(
+                self, "Already Added",
+                f"{slide_name} is already in the atlas."
+            )
+            return
+
+        # Get the current H5 path for reference
+        info = self.slides.get(slide_name)
+        h5_path = ""
+        if info:
+            selected_models = self.model_selector.getSelectedModels()
+            mag = self.mag_combo.currentText()
+            patch = self.patch_combo.currentText()
+            if selected_models and mag and patch:
+                h5_path = info.models.get(selected_models[0], {}).get(mag, {}).get(patch, "")
+
+        # Generate a color for this slide based on its index
+        slide_idx = self.atlas_slide_list.count()
+        hue = (slide_idx * 137) % 360  # Golden angle for good color distribution
+        color = QColor.fromHslF(hue / 360.0, 0.7, 0.5)
+
+        if self._current_coords_lv0 is None:
+            QMessageBox.warning(
+                self, "No Coordinates",
+                "Current slide coordinates are unavailable for atlas creation."
+            )
+            return
+
+        # Add to the list widget
+        self.atlas_slide_list.add_slide(
+            slide_name,
+            self._current_features.copy(),
+            self._current_coords_lv0.copy(),
+            h5_path,
+            color
+        )
+
+        print(f"DEBUG: Added {slide_name} to atlas ({len(self._current_features)} patches)")
+        self._update_atlas_ui_state()
+
+    def _on_atlas_slide_removed(self, slide_name: str) -> None:
+        """Handle removal of a slide from the atlas builder."""
+        print(f"DEBUG: Removed {slide_name} from atlas")
+        self._update_atlas_ui_state()
+
+    def _update_atlas_ui_state(self) -> None:
+        """Update atlas UI controls based on current state."""
+        slide_count = self.atlas_slide_list.count()
+
+        # Enable/disable build button (need at least 2 slides)
+        self.build_atlas_btn.setEnabled(slide_count >= 2)
+
+        # Enable/disable clear button
+        self.clear_atlas_btn.setEnabled(slide_count > 0 or self._cluster_atlas is not None)
+
+        # Update info label
+        if slide_count == 0:
+            self.atlas_info_label.setText("Add at least 2 slides to build atlas")
+        elif slide_count == 1:
+            self.atlas_info_label.setText("Add 1 more slide to build atlas")
+        else:
+            total_patches = sum(
+                len(data['features'])
+                for data in self.atlas_slide_list.get_all_slide_data().values()
+            )
+            self.atlas_info_label.setText(
+                f"{slide_count} slides, {total_patches:,} total patches"
+            )
+
+    def _build_atlas(self) -> None:
+        """Build the cross-slide cluster atlas."""
+        slide_data = self.atlas_slide_list.get_all_slide_data()
+
+        if len(slide_data) < 2:
+            QMessageBox.warning(
+                self, "Not Enough Slides",
+                "Add at least 2 slides to build an atlas."
+            )
+            return
+
+        # Show progress
+        self.atlas_progress.setVisible(True)
+        self.atlas_progress.setValue(0)
+        self.build_atlas_btn.setEnabled(False)
+        QApplication.processEvents()
+
+        try:
+            # Create builder
+            n_clusters = self.atlas_k_spin.value()
+            builder = AtlasBuilder(n_clusters=n_clusters, max_patches_per_slide=50000)
+
+            # Add slides to builder
+            for slide_name, data in slide_data.items():
+                patches_added = builder.add_slide(
+                    slide_name,
+                    data['features'],
+                    data['coords']
+                )
+                print(f"DEBUG: Atlas builder added {slide_name} with {patches_added} patches")
+
+            self.atlas_progress.setValue(10)
+            QApplication.processEvents()
+
+            # Define progress callback
+            def update_progress(pct: int) -> None:
+                # Scale from 10-90%
+                scaled = 10 + int(pct * 0.8)
+                self.atlas_progress.setValue(scaled)
+                QApplication.processEvents()
+
+            # Build the atlas
+            self._cluster_atlas = builder.build(progress_callback=update_progress)
+
+            self.atlas_progress.setValue(95)
+            QApplication.processEvents()
+
+            # Populate the atlas scatter view
+            self.atlas_scatter_view.populate(self._cluster_atlas)
+
+            # Show the atlas scatter dock
+            self.atlas_scatter_dock.show()
+
+            # Position it near the regular scatter dock if visible
+            if self.scatter_dock.isVisible():
+                scatter_pos = self.scatter_dock.pos()
+                self.atlas_scatter_dock.move(scatter_pos.x() + 20, scatter_pos.y() + 20)
+
+            self.atlas_progress.setValue(100)
+
+            # Update info label with atlas statistics
+            self.atlas_info_label.setText(
+                f"Atlas built: {len(self._cluster_atlas.slide_names)} slides, "
+                f"{len(self._cluster_atlas.global_labels):,} patches, "
+                f"{self._cluster_atlas.n_clusters} clusters"
+            )
+
+            print(f"DEBUG: Atlas built successfully with {self._cluster_atlas.n_clusters} clusters")
+
+        except Exception as e:
+            QMessageBox.critical(
+                self, "Atlas Build Failed",
+                f"Failed to build atlas:\n{str(e)}"
+            )
+            print(f"DEBUG: Atlas build failed: {e}")
+            import traceback
+            traceback.print_exc()
+
+        finally:
+            self.atlas_progress.setVisible(False)
+            self._update_atlas_ui_state()
+
+    def _clear_atlas(self) -> None:
+        """Clear the atlas builder and scatter view."""
+        # Clear the slide list
+        self.atlas_slide_list.clear()
+
+        # Clear the atlas
+        self._cluster_atlas = None
+
+        # Clear the scatter view
+        self.atlas_scatter_view.scene().clear()
+
+        # Hide the atlas dock
+        self.atlas_scatter_dock.hide()
+
+        # Update UI
+        self._update_atlas_ui_state()
+        print("DEBUG: Atlas cleared")
+
+    def _on_atlas_cluster_selected(self, cluster_id: int) -> None:
+        """Handle click on a cluster in the atlas scatter view."""
+        if self._cluster_atlas is None:
+            return
+
+        print(f"DEBUG: Atlas cluster {cluster_id} selected")
+
+        # Highlight the cluster in the atlas scatter view
+        self.atlas_scatter_view.highlight_cluster(cluster_id)
+
+        # Get statistics for this cluster
+        total_count = self._cluster_atlas.get_cluster_count(cluster_id)
+        per_slide = []
+        for slide_name in self._cluster_atlas.slide_names:
+            count = self._cluster_atlas.get_slide_cluster_count(slide_name, cluster_id)
+            if count > 0:
+                per_slide.append(f"{slide_name}: {count:,}")
+
+        # Update info label
+        self.atlas_info_label.setText(
+            f"Cluster {cluster_id}: {total_count:,} patches\n" +
+            "\n".join(per_slide[:5])  # Show top 5 slides
+        )
+
+    def _on_atlas_point_hovered(self, global_idx: int, slide_idx: int, entering: bool) -> None:
+        """Handle hover on a point in the atlas scatter view."""
+        if not entering or self._cluster_atlas is None:
+            return
+
+        # Get slide name and cluster info
+        if slide_idx < len(self._cluster_atlas.slide_names):
+            slide_name = self._cluster_atlas.slide_names[slide_idx]
+            cluster_id = int(self._cluster_atlas.global_labels[global_idx])
+
+            # Could show a tooltip or update status bar
+            self.statusBar().showMessage(
+                f"Slide: {slide_name} | Cluster: {cluster_id}",
+                2000
+            )

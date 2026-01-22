@@ -167,6 +167,7 @@ class SlideGraphicsView(QGraphicsView):
     # Signals for cluster selection and hover
     cluster_selected = Signal(int, tuple, bool)  # cluster number, click position, ctrl pressed
     patch_hovered = Signal(int, bool)  # patch index and hover state
+    preview_action_attempted = Signal()  # emitted when clicking without model data
     # Signals for animation synchronization
     patches_highlighted = Signal(list)  # list of patch indices highlighted this step
     animation_completed = Signal()  # emitted when cascade animation finishes
@@ -699,6 +700,12 @@ class SlideGraphicsView(QGraphicsView):
                 "coords": self.coords is None,
                 "labels": self.labels is None
             })
+            if has_image:
+                self.preview_action_attempted.emit()
+            return
+
+        if len(self.coords) == 0 or len(self.labels) == 0:
+            self.preview_action_attempted.emit()
             return
 
         # Map the click position to the scene
@@ -830,12 +837,17 @@ class SlideGraphicsView(QGraphicsView):
         
         x = scene_pos.x()
         y = scene_pos.y()
+        if self.coords is None or len(self.coords) == 0 or self.labels is None or len(self.labels) == 0:
+            self.patch_hovered.emit(-1, False)
+            super().mouseMoveEvent(event)
+            return
+
         # Determine nearest patch by Euclidean distance
         patch_centres = self.coords + self.patch_size / 2.0
         diffs = patch_centres - np.array([x, y])
         dists = np.einsum('ij,ij->i', diffs, diffs)
         idx = int(np.argmin(dists))
-# Emit hover signal with the index
+        # Emit hover signal with the index
         self.patch_hovered.emit(idx, True)
         super().mouseMoveEvent(event)
         
@@ -844,7 +856,12 @@ class SlideGraphicsView(QGraphicsView):
         # Determine zoom factor based on scroll direction
         factor = 1.25 if event.angleDelta().y() > 0 else 0.8
         print(f"DEBUG: Slide view zoom with factor {factor}")
+
+        old_pos = self.mapToScene(event.position().toPoint())
         self.scale(factor, factor)
+        new_pos = self.mapToScene(event.position().toPoint())
+        delta = old_pos - new_pos
+        self.translate(delta.x(), delta.y())
 
         # In adaptive mode, update visible tiles after zoom
         if self.tile_manager is not None:
