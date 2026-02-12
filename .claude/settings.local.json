@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(dir \"C:\\\\Users\\\\Brennan\\\\CursorProjects\\\\FoundationalDetector\" /b)",
+      "Bash(findstr:*)",
+      "Bash(python -m py_compile:*)"
+    ]
+  }
+}
