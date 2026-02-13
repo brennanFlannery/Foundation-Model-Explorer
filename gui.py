@@ -1349,7 +1349,8 @@ class AtlasSlideListWidget(QWidget):
         self._slide_rows: Dict[str, QWidget] = {}
 
     def add_slide(self, slide_name: str, features: np.ndarray, coords: np.ndarray,
-                  h5_path: str = "", color: QColor = None) -> None:
+                  h5_path: str = "", color: QColor = None,
+                  alias: Optional[str] = None) -> None:
         """Add a slide to the list.
 
         Parameters
@@ -1396,7 +1397,9 @@ class AtlasSlideListWidget(QWidget):
             row_layout.addWidget(color_label)
 
         # Slide name
-        name_label = QLabel(slide_name[:25] + "..." if len(slide_name) > 25 else slide_name)
+        display = alias if alias else (slide_name[:25] + "\u2026" if len(slide_name) > 25 else slide_name)
+        name_label = QLabel(display)
+        name_label.setStyleSheet("color: black;")
         name_label.setToolTip(slide_name)
         row_layout.addWidget(name_label, stretch=1)
 
@@ -1485,9 +1488,11 @@ class SlideThumbnailItem(QFrame):
 
     clicked = Signal(str)
 
-    def __init__(self, slide_name: str, thumb_size: QSize, parent=None) -> None:
+    def __init__(self, slide_name: str, thumb_size: QSize,
+                 display_name: Optional[str] = None, parent=None) -> None:
         super().__init__(parent)
         self._slide_name = slide_name
+        self._display_name = display_name or slide_name
         self._thumb_size = thumb_size
         self._clickable = True
 
@@ -1585,7 +1590,7 @@ class SlideThumbnailItem(QFrame):
     def _update_name_label(self) -> None:
         metrics = self._name_label.fontMetrics()
         available_width = max(self._name_label.width() - 6, 20)
-        elided = metrics.elidedText(self._slide_name, Qt.ElideRight, available_width)
+        elided = metrics.elidedText(self._display_name, Qt.ElideRight, available_width)
         self._name_label.setText(elided)
         self._name_label.setToolTip(self._slide_name)
 
@@ -1604,8 +1609,9 @@ class SlideThumbnailListWidget(QWidget):
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
-        self._thumb_size = QSize(120, 80)
+        self._thumb_size = QSize(120, 40)
         self._items: Dict[str, SlideThumbnailItem] = {}
+        self._slide_numbers: Dict[str, int] = {}
         self._slide_paths: Dict[str, str] = {}
         self._tasks: Dict[str, ThumbnailLoadTask] = {}
         self._thread_pool = QThreadPool()
@@ -1639,13 +1645,17 @@ class SlideThumbnailListWidget(QWidget):
         """Populate the thumbnail list with slides."""
         self._clear_items()
         self._slide_paths.clear()
+        self._slide_numbers.clear()
 
-        for slide_name in slide_names:
+        for idx, slide_name in enumerate(slide_names):
+            number = idx + 1
+            self._slide_numbers[slide_name] = number
             info = slide_infos.get(slide_name)
             image_path = info.image_path if info else ""
             self._slide_paths[slide_name] = image_path
 
-            item = SlideThumbnailItem(slide_name, self._thumb_size)
+            display_name = f"{number}  {slide_name}"
+            item = SlideThumbnailItem(slide_name, self._thumb_size, display_name=display_name)
             item.clicked.connect(self.slide_selected.emit)
             self._content_layout.insertWidget(self._content_layout.count() - 1, item)
             self._items[slide_name] = item
@@ -1661,6 +1671,10 @@ class SlideThumbnailListWidget(QWidget):
         """Highlight the currently selected slide."""
         for name, item in self._items.items():
             item.set_selected(name == slide_name)
+
+    def get_slide_number(self, slide_name: str) -> Optional[int]:
+        """Return the 1-based position of a slide, or None if not found."""
+        return self._slide_numbers.get(slide_name)
 
     def _clear_items(self) -> None:
         for item in self._items.values():
@@ -1804,6 +1818,350 @@ class ModelSelectionDialog(QDialog):
         return sorted(set.intersection(*patch_sets))
 
 
+def _qcolors_to_hsl_strings(colors: List[QColor]) -> List[str]:
+    """Convert a list of QColor objects to HSL CSS strings understood by the views."""
+    result = []
+    for c in colors:
+        h = max(0, c.hslHue())
+        s = int(c.hslSaturationF() * 100)
+        l = int(c.lightnessF() * 100)
+        result.append(f"hsl({h},{s}%,{l}%)")
+    return result
+
+
+class AtlasThumbnailView(QGraphicsView):
+    """Simplified thumbnail view with patch overlays for atlas display.
+
+    Displays a small thumbnail of a slide with colored patch rectangles
+    representing cluster assignments. Used in the atlas thumbnail panel
+    to show cluster highlights across all atlas slides simultaneously.
+    """
+    clicked = Signal(str)  # Emits slide_name - placeholder for future
+
+    THUMB_WIDTH = 150
+    THUMB_HEIGHT = 100
+
+    def __init__(self, slide_name: str, parent=None):
+        super().__init__(parent)
+        self._slide_name = slide_name
+        self._scene = QGraphicsScene(self)
+        self.setScene(self._scene)
+        self._rect_items: List[QGraphicsRectItem] = []
+        self._labels: Optional[np.ndarray] = None
+        self._cluster_colors: List[QColor] = []
+        self._pixmap_item: Optional[QGraphicsPixmapItem] = None
+
+        # Fixed size for thumbnails
+        self.setFixedSize(self.THUMB_WIDTH + 4, self.THUMB_HEIGHT + 4)
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.setRenderHint(QPainter.Antialiasing, False)
+        self.setStyleSheet("border: 1px solid #999;")
+
+    def load_data(self, image: QImage, coords: np.ndarray,
+                  labels: np.ndarray, cluster_colors: List[QColor],
+                  original_dims: Tuple[int, int]) -> None:
+        """Load thumbnail image and create patch overlay rectangles.
+
+        Parameters
+        ----------
+        image : QImage
+            The thumbnail image to display.
+        coords : np.ndarray
+            Patch coordinates in original slide dimensions (level 0).
+        labels : np.ndarray
+            Cluster labels for each patch.
+        cluster_colors : List[QColor]
+            Colors for each cluster.
+        original_dims : Tuple[int, int]
+            Original slide dimensions (width, height) for coordinate scaling.
+        """
+        self._scene.clear()
+        self._rect_items.clear()
+        self._labels = labels
+        self._cluster_colors = cluster_colors
+
+        # Set background image
+        pixmap = QPixmap.fromImage(image)
+        scaled_pixmap = pixmap.scaled(
+            self.THUMB_WIDTH, self.THUMB_HEIGHT,
+            Qt.KeepAspectRatio, Qt.SmoothTransformation
+        )
+        self._pixmap_item = self._scene.addPixmap(scaled_pixmap)
+
+        # Calculate scale factors
+        thumb_w = scaled_pixmap.width()
+        thumb_h = scaled_pixmap.height()
+        scale_x = thumb_w / original_dims[0] if original_dims[0] > 0 else 1.0
+        scale_y = thumb_h / original_dims[1] if original_dims[1] > 0 else 1.0
+
+        # Estimate patch size from coords (assume square patches)
+        if len(coords) > 1:
+            # Find minimum distance between adjacent patches
+            diffs = np.diff(np.sort(coords[:, 0]))
+            diffs = diffs[diffs > 0]
+            patch_size_lv0 = float(np.min(diffs)) if len(diffs) > 0 else 256.0
+        else:
+            patch_size_lv0 = 256.0
+
+        thumb_patch_size = max(2, patch_size_lv0 * scale_x)
+
+        # Create rect items for each patch
+        for i, (x, y) in enumerate(coords[:, :2]):
+            tx = x * scale_x
+            ty = y * scale_y
+            color = cluster_colors[labels[i]] if labels[i] < len(cluster_colors) else QColor(128, 128, 128)
+
+            rect = self._scene.addRect(
+                tx, ty, thumb_patch_size, thumb_patch_size,
+                QPen(Qt.NoPen),
+                QBrush(color)
+            )
+            rect.setOpacity(0.0)  # Initially hidden
+            self._rect_items.append(rect)
+
+        # Fit view to scene
+        self._scene.setSceneRect(0, 0, thumb_w, thumb_h)
+        self.fitInView(self._scene.sceneRect(), Qt.KeepAspectRatio)
+
+    def highlight_cluster(self, cluster_id: int, selected_clusters: Set[int]) -> None:
+        """Highlight patches belonging to selected clusters.
+
+        Parameters
+        ----------
+        cluster_id : int
+            The primary cluster that was clicked.
+        selected_clusters : Set[int]
+            All currently selected clusters (for multi-select support).
+        """
+        if self._labels is None:
+            return
+
+        for i, rect in enumerate(self._rect_items):
+            label = int(self._labels[i])
+            if label in selected_clusters:
+                rect.setOpacity(0.6)
+            else:
+                rect.setOpacity(0.0)
+
+    def clear_highlight(self) -> None:
+        """Hide all patch overlays."""
+        for rect in self._rect_items:
+            rect.setOpacity(0.0)
+
+    def mousePressEvent(self, event) -> None:
+        """Emit clicked signal on mouse press."""
+        if event.button() == Qt.LeftButton:
+            self.clicked.emit(self._slide_name)
+        super().mousePressEvent(event)
+
+
+class AtlasThumbnailLoadTask(QObject, QRunnable):
+    """Background task for loading atlas slide thumbnails."""
+
+    loaded = Signal(str, QImage, tuple)  # slide_name, image, original_dims
+    failed = Signal(str, str)  # slide_name, error_msg
+
+    def __init__(self, slide_name: str, image_path: str, max_size: int = 150) -> None:
+        QObject.__init__(self)
+        QRunnable.__init__(self)
+        self._slide_name = slide_name
+        self._image_path = image_path
+        self._max_size = max_size
+
+    def run(self) -> None:
+        try:
+            # Load thumbnail and get original dimensions
+            image = data_loader.load_thumbnail(self._image_path, max_size=self._max_size)
+
+            # Get original slide dimensions
+            import openslide
+            slide = openslide.OpenSlide(self._image_path)
+            original_dims = slide.dimensions
+            slide.close()
+
+            qimage = QImage(ImageQt(image))
+            self.loaded.emit(self._slide_name, qimage, original_dims)
+        except Exception as exc:
+            self.failed.emit(self._slide_name, str(exc))
+
+
+class AtlasThumbnailPanel(QWidget):
+    """Vertical scrollable panel of atlas slide thumbnails with patch overlays.
+
+    Displays thumbnails of all slides in the atlas. When a cluster is selected,
+    patches belonging to that cluster are highlighted on all thumbnails
+    simultaneously, enabling visual comparison across slides.
+    """
+    slide_clicked = Signal(str)  # Placeholder for future click handling
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._thumbnail_views: Dict[str, AtlasThumbnailView] = {}
+        self._pending_tasks: Dict[str, AtlasThumbnailLoadTask] = {}
+        self._thread_pool = QThreadPool()
+        self._thread_pool.setMaxThreadCount(2)
+        self._atlas: Optional[ClusterAtlas] = None
+
+        # Layout
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(4, 4, 4, 4)
+        layout.setSpacing(4)
+
+        # Header
+        header = QLabel("Atlas Slides")
+        header.setStyleSheet("font-weight: bold; font-size: 11px;")
+        layout.addWidget(header)
+
+        # Scroll area for thumbnails
+        self._scroll_area = QScrollArea()
+        self._scroll_area.setWidgetResizable(True)
+        self._scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self._scroll_area.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+
+        # Container widget for scroll area
+        self._container = QWidget()
+        self._container_layout = QVBoxLayout(self._container)
+        self._container_layout.setContentsMargins(0, 0, 0, 0)
+        self._container_layout.setSpacing(6)
+        self._container_layout.addStretch()
+
+        self._scroll_area.setWidget(self._container)
+        layout.addWidget(self._scroll_area)
+
+        # Set fixed width for the panel
+        self.setFixedWidth(AtlasThumbnailView.THUMB_WIDTH + 24)
+
+    def populate(self, atlas: ClusterAtlas, slides: Dict[str, 'data_loader.SlideInfo'],
+                 slide_numbers: Optional[Dict[str, int]] = None) -> None:
+        """Populate the panel with thumbnails for all atlas slides.
+
+        Parameters
+        ----------
+        atlas : ClusterAtlas
+            The built cluster atlas containing slide entries.
+        slides : Dict[str, SlideInfo]
+            Dictionary mapping slide names to their info (for image paths).
+        slide_numbers : Dict[str, int], optional
+            Mapping of slide name to 1-based index for compact labels.
+        """
+        self.clear()
+        self._atlas = atlas
+
+        # Get cluster colors from atlas
+        cluster_colors = [QColor(c) for c in atlas.cluster_colors]
+
+        for slide_name in atlas.slide_names:
+            # Create thumbnail view
+            view = AtlasThumbnailView(slide_name)
+            view.clicked.connect(self._on_thumbnail_clicked)
+
+            # Add slide name label — show "#N" if a number mapping is available
+            if slide_numbers and slide_name in slide_numbers:
+                label_text = f"#{slide_numbers[slide_name]}"
+            else:
+                label_text = slide_name
+            name_label = QLabel(label_text)
+            name_label.setToolTip(slide_name)
+            name_label.setStyleSheet("font-size: 9px;")
+            name_label.setWordWrap(True)
+            name_label.setMaximumWidth(AtlasThumbnailView.THUMB_WIDTH)
+
+            # Container for view + label
+            item_container = QWidget()
+            item_layout = QVBoxLayout(item_container)
+            item_layout.setContentsMargins(0, 0, 0, 0)
+            item_layout.setSpacing(2)
+            item_layout.addWidget(view, alignment=Qt.AlignCenter)
+            item_layout.addWidget(name_label, alignment=Qt.AlignCenter)
+
+            # Insert before the stretch
+            self._container_layout.insertWidget(
+                self._container_layout.count() - 1,
+                item_container
+            )
+
+            self._thumbnail_views[slide_name] = view
+
+            # Start async thumbnail load
+            slide_info = slides.get(slide_name)
+            if slide_info and slide_info.image_path:
+                task = AtlasThumbnailLoadTask(
+                    slide_name,
+                    slide_info.image_path,
+                    max_size=AtlasThumbnailView.THUMB_WIDTH
+                )
+                task.loaded.connect(self._on_thumbnail_loaded)
+                task.failed.connect(self._on_thumbnail_failed)
+                self._pending_tasks[slide_name] = task
+                self._thread_pool.start(task)
+
+    def _on_thumbnail_loaded(self, slide_name: str, image: QImage,
+                             original_dims: Tuple[int, int]) -> None:
+        """Handle successful thumbnail load."""
+        if slide_name not in self._thumbnail_views or self._atlas is None:
+            return
+
+        view = self._thumbnail_views[slide_name]
+        entry = self._atlas.entries.get(slide_name)
+        if entry is None:
+            return
+
+        # Get cluster colors from atlas
+        cluster_colors = [QColor(c) for c in self._atlas.cluster_colors]
+
+        view.load_data(
+            image,
+            entry.coords,
+            entry.global_labels,
+            cluster_colors,
+            original_dims
+        )
+
+        # Clean up task reference
+        self._pending_tasks.pop(slide_name, None)
+
+    def _on_thumbnail_failed(self, slide_name: str, error_msg: str) -> None:
+        """Handle failed thumbnail load."""
+        print(f"DEBUG: Atlas thumbnail load failed for {slide_name}: {error_msg}")
+        self._pending_tasks.pop(slide_name, None)
+
+    def _on_thumbnail_clicked(self, slide_name: str) -> None:
+        """Forward click to panel signal."""
+        self.slide_clicked.emit(slide_name)
+
+    def highlight_cluster(self, cluster_id: int, selected_clusters: Set[int]) -> None:
+        """Highlight patches in selected clusters on all thumbnails.
+
+        Parameters
+        ----------
+        cluster_id : int
+            The primary cluster that was selected.
+        selected_clusters : Set[int]
+            All currently selected clusters.
+        """
+        for view in self._thumbnail_views.values():
+            view.highlight_cluster(cluster_id, selected_clusters)
+
+    def clear_highlight(self) -> None:
+        """Clear highlights on all thumbnails."""
+        for view in self._thumbnail_views.values():
+            view.clear_highlight()
+
+    def clear(self) -> None:
+        """Remove all thumbnail views and reset state."""
+        # Cancel pending tasks (they'll be ignored when they complete)
+        self._pending_tasks.clear()
+        self._thumbnail_views.clear()
+        self._atlas = None
+
+        # Remove all widgets except the stretch
+        while self._container_layout.count() > 1:
+            item = self._container_layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+
+
 class MainWindow(QMainWindow):
     """Main application window for FoundationDetector.
     
@@ -1907,6 +2265,7 @@ class MainWindow(QMainWindow):
         self._cluster_centroids: Optional[np.ndarray] = None
         self._max_cluster_distances: Optional[np.ndarray] = None
         self._current_labels: Optional[np.ndarray] = None
+        self._current_colours: Optional[List[str]] = None
         # Persisted model selection for session
         self._model_selection: Optional[ModelSelection] = None
         # Track cascade animation state to prevent hover interference
@@ -1927,14 +2286,6 @@ class MainWindow(QMainWindow):
         central = QWidget()
         self.setCentralWidget(central)
         main_vbox = QVBoxLayout(central)
-        
-        # Folder selection row (button removed - now in File menu)
-        folder_row = QHBoxLayout()
-        self.root_label = QLabel("No folder selected")
-        self.root_label.setWordWrap(True)
-        self.root_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
-        folder_row.addWidget(self.root_label)
-        main_vbox.addLayout(folder_row)
         
         # Slide thumbnail selection list
         self.slide_combo = QComboBox()
@@ -2094,13 +2445,21 @@ class MainWindow(QMainWindow):
         # Connect local region selection signal
         self.graphics_view.local_region_selected.connect(self._on_local_region_selected)
 
+        # Atlas thumbnail panel (hidden until atlas is built)
+        self.atlas_thumbnail_panel = AtlasThumbnailPanel()
+        self.atlas_thumbnail_panel.setVisible(False)
+        self.atlas_thumbnail_panel.slide_clicked.connect(self._on_atlas_thumbnail_clicked)
+
         splitter = QSplitter(Qt.Horizontal)
         splitter.addWidget(self.sidebar_tabs)
+        splitter.addWidget(self.atlas_thumbnail_panel)
         splitter.addWidget(self.graphics_view)
-        splitter.setStretchFactor(0, 0)
-        splitter.setStretchFactor(1, 1)
+        splitter.setStretchFactor(0, 0)  # sidebar: no stretch
+        splitter.setStretchFactor(1, 0)  # thumbnail panel: no stretch
+        splitter.setStretchFactor(2, 1)  # main view: stretch
         splitter.setCollapsible(0, False)
         splitter.setCollapsible(1, False)
+        splitter.setCollapsible(2, False)
 
         main_vbox.addWidget(splitter, stretch=1)
         
@@ -2276,8 +2635,6 @@ class MainWindow(QMainWindow):
             print("DEBUG: No directory selected")
             return
         print(f"DEBUG: Selected directory: {directory}")
-        self.root_label.setText(directory)
-        
         try:
             print("DEBUG: Attempting to parse directory...")
             self.slides = data_loader.parse_root_directory(directory)
@@ -3146,7 +3503,7 @@ class MainWindow(QMainWindow):
     def _update_scatter_for_cluster(self, cluster: int, click_point: Tuple[float, float],
                                     ctrl_pressed: bool) -> None:
         """Prepare scatter plot for synchronized cascade animation.
-        
+
         This method sets up the scatter plot's initial state before the slide
         animation begins. The actual cascade animation is handled through the
         patches_highlighted signal from SlideGraphicsView, which ensures both
@@ -3162,6 +3519,10 @@ class MainWindow(QMainWindow):
             self._set_selected_clusters({cluster})
         self._prepare_scatter_for_cascade(cluster)
         self._start_slide_cascade(cluster, click_point)
+
+        # Also highlight on atlas thumbnails when atlas is active
+        if self._is_atlas_active():
+            self.atlas_thumbnail_panel.highlight_cluster(cluster, self._selected_clusters)
 
     def _prepare_scatter_for_cascade(self, cluster: int) -> None:
         """Prepare scatter points for a new cascade animation."""
@@ -3762,10 +4123,11 @@ class MainWindow(QMainWindow):
 
             # Update cluster legend
             self.cluster_legend.update_clusters(labels, colours)
-            
+
             # Compute and store centroids
             self._cluster_centroids = self._compute_centroids(features, labels)
             self._current_labels = labels
+            self._current_colours = colours
             
             # Determine whether to use adaptive or thumbnail mode
             use_adaptive = (
@@ -3805,6 +4167,9 @@ class MainWindow(QMainWindow):
             # Populate scatter plot using new view
             self.scatter_view.populate(self._current_embedding, labels, colours)
             print("DEBUG: Data loading complete; views updated")
+            # If atlas is active for this slide, apply atlas labels/colors over local ones
+            if self._is_atlas_active():
+                self._apply_atlas_to_views()
             # Hide progress bar when done
             self.progress_bar.setVisible(False)
         else:
@@ -3823,14 +4188,18 @@ class MainWindow(QMainWindow):
 
             # Update cluster legend
             self.cluster_legend.update_clusters(labels, colours)
-            
+
             # Compute and store centroids
             self._cluster_centroids = self._compute_centroids(features, labels)
             self._current_labels = labels
-            
+            self._current_colours = colours
+
             # Update both views with new labels and colours
             self.graphics_view.update_labels_and_colours(labels, colours)
             self.scatter_view.populate(self._current_embedding, labels, colours)
+            # If atlas is active for this slide, re-apply atlas overlay
+            if self._is_atlas_active():
+                self._apply_atlas_to_views()
     
     def _compute_centroids(self, features: np.ndarray, labels: np.ndarray) -> np.ndarray:
         """Compute centroid of each cluster in feature space.
@@ -4165,12 +4534,81 @@ class MainWindow(QMainWindow):
     # Local Region Selection Mode
     # -------------------------------------------------------------------------
 
+    # -------------------------------------------------------------------------
+    # Atlas / local mode helpers
+    # -------------------------------------------------------------------------
+
+    def _get_atlas_entry_for_current_slide(self):
+        """Return the SlideAtlasEntry for the currently displayed slide, or None.
+
+        Returns None if:
+        - No atlas has been built
+        - The current slide was not added to the atlas
+        - The patch count in the atlas entry doesn't match the loaded slide
+          (can happen when the atlas was built from a subsampled version)
+        """
+        if self._cluster_atlas is None:
+            return None
+        slide_name = self.slide_combo.currentText()
+        if not slide_name:
+            return None
+        entry = self._cluster_atlas.entries.get(slide_name)
+        if entry is None:
+            return None
+        # Verify patch count matches so indices are consistent
+        if self._current_labels is not None:
+            if len(entry.global_labels) != len(self._current_labels):
+                return None
+        return entry
+
+    def _is_atlas_active(self) -> bool:
+        """Return True when atlas groups should supersede local K-means groups.
+
+        True when:
+        - An atlas has been built
+        - The K-means tab (index 0) is NOT selected
+        - The current slide is present in the atlas with a matching patch count
+        """
+        return (
+            self._cluster_atlas is not None
+            and self.sidebar_tabs.currentIndex() != 0
+            and self._get_atlas_entry_for_current_slide() is not None
+        )
+
+    def _apply_atlas_to_views(self) -> None:
+        """Push atlas labels and atlas PCA coords into the slide and scatter views."""
+        entry = self._get_atlas_entry_for_current_slide()
+        if entry is None or self._cluster_atlas is None:
+            return
+        atlas_labels = entry.global_labels
+        atlas_colours = _qcolors_to_hsl_strings(self._cluster_atlas.cluster_colors)
+        self.graphics_view.update_labels_and_colours(atlas_labels, atlas_colours)
+        # Retrieve the PCA coords for this slide's patches from the global array
+        pca_coords = self._cluster_atlas.global_pca_coords[entry.local_to_global]
+        self.scatter_view.populate(pca_coords, atlas_labels, atlas_colours)
+
+    def _restore_local_to_views(self) -> None:
+        """Restore local K-means labels and PCA coords to the slide and scatter views."""
+        if self._current_labels is None or self._current_colours is None:
+            return
+        self.graphics_view.update_labels_and_colours(
+            self._current_labels, self._current_colours)
+        if self._current_embedding is not None:
+            self.scatter_view.populate(
+                self._current_embedding, self._current_labels, self._current_colours)
+
     def _on_sidebar_tab_changed(self, index: int) -> None:
         """Handle sidebar tab change to switch selection modes."""
-        if index == 0:  # K-means tab
+        if index == 0:  # K-means tab — always use local groups
             self._set_selection_mode(SelectionMode.KMEANS)
+            self._restore_local_to_views()
         elif index == 1:  # Local Region tab
             self._set_selection_mode(SelectionMode.LOCAL_REGION)
+            if self._is_atlas_active():
+                self._apply_atlas_to_views()
+        else:  # Atlas tab (index 2) and any future tabs
+            if self._is_atlas_active():
+                self._apply_atlas_to_views()
 
     def _set_selection_mode(self, mode: SelectionMode) -> None:
         """Switch between K-means and Local Region selection modes."""
@@ -4830,6 +5268,16 @@ class MainWindow(QMainWindow):
     # Cross-Slide Atlas Methods
     # -------------------------------------------------------------------------
 
+    def _on_atlas_thumbnail_clicked(self, slide_name: str) -> None:
+        """Placeholder for future: handle click on atlas thumbnail.
+
+        Parameters
+        ----------
+        slide_name : str
+            Name of the slide whose thumbnail was clicked.
+        """
+        pass  # Reserved for future functionality
+
     def _on_atlas_add_current(self) -> None:
         """Add the currently loaded slide to the atlas builder."""
         if self._current_features is None:
@@ -4874,12 +5322,15 @@ class MainWindow(QMainWindow):
             return
 
         # Add to the list widget
+        number = self.slide_thumbnail_list.get_slide_number(slide_name)
+        alias = f"#{number}" if number is not None else None
         self.atlas_slide_list.add_slide(
             slide_name,
             self._current_features.copy(),
             self._current_coords_lv0.copy(),
             h5_path,
-            color
+            color,
+            alias=alias
         )
 
         print(f"DEBUG: Added {slide_name} to atlas ({len(self._current_features)} patches)")
@@ -4972,6 +5423,13 @@ class MainWindow(QMainWindow):
                 scatter_pos = self.scatter_dock.pos()
                 self.atlas_scatter_dock.move(scatter_pos.x() + 20, scatter_pos.y() + 20)
 
+            # Populate and show the atlas thumbnail panel
+            self.atlas_thumbnail_panel.populate(
+                self._cluster_atlas, self.slides,
+                slide_numbers=self.slide_thumbnail_list._slide_numbers
+            )
+            self.atlas_thumbnail_panel.setVisible(True)
+
             self.atlas_progress.setValue(100)
 
             # Update info label with atlas statistics
@@ -4982,6 +5440,10 @@ class MainWindow(QMainWindow):
             )
 
             print(f"DEBUG: Atlas built successfully with {self._cluster_atlas.n_clusters} clusters")
+
+            # If the user is not on the K-means tab, immediately apply atlas labels
+            if self.sidebar_tabs.currentIndex() != 0:
+                self._apply_atlas_to_views()
 
         except Exception as e:
             QMessageBox.critical(
@@ -5010,6 +5472,10 @@ class MainWindow(QMainWindow):
         # Hide the atlas dock
         self.atlas_scatter_dock.hide()
 
+        # Clear and hide the atlas thumbnail panel
+        self.atlas_thumbnail_panel.clear()
+        self.atlas_thumbnail_panel.setVisible(False)
+
         # Update UI
         self._update_atlas_ui_state()
         print("DEBUG: Atlas cleared")
@@ -5037,6 +5503,23 @@ class MainWindow(QMainWindow):
             f"Cluster {cluster_id}: {total_count:,} patches\n" +
             "\n".join(per_slide[:5])  # Show top 5 slides
         )
+
+        # Cascade animation on the current slide using atlas cluster membership.
+        # graphics_view.labels is already atlas labels when atlas is active, so
+        # the existing cascade machinery works without modification.
+        entry = self._get_atlas_entry_for_current_slide()
+        if entry is not None and self.graphics_view.coords is not None:
+            cluster_indices = np.where(entry.global_labels == cluster_id)[0]
+            if cluster_indices.size > 0:
+                idx0 = int(cluster_indices[0])
+                x, y = (self.graphics_view.coords[idx0]
+                        + self.graphics_view.patch_size / 2.0)
+                self._set_selected_clusters({cluster_id})
+                self._prepare_scatter_for_cascade(cluster_id)
+                self._start_slide_cascade(cluster_id, (float(x), float(y)))
+
+        # Highlight on all atlas thumbnails (no animation, instant)
+        self.atlas_thumbnail_panel.highlight_cluster(cluster_id, self._selected_clusters)
 
     def _on_atlas_point_hovered(self, global_idx: int, slide_idx: int, entering: bool) -> None:
         """Handle hover on a point in the atlas scatter view."""
