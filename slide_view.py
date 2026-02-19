@@ -189,7 +189,9 @@ class SlideGraphicsView(QGraphicsView):
         # Track mouse movements for hover events
         self.setMouseTracking(True)
         # Set cross‑hair cursor by default
-        self.setCursor(Qt.CursorShape.CrossCursor)
+        self._current_cursor = Qt.CursorShape.CrossCursor
+        self._override_pushed: bool = False
+        self._set_cursor(Qt.CursorShape.CrossCursor)
         # Use NoDrag by default; panning will be enabled on middle click
         self.setDragMode(QGraphicsView.DragMode.NoDrag)
         
@@ -230,6 +232,54 @@ class SlideGraphicsView(QGraphicsView):
         # Local region selection mode state
         self._local_region_mode: bool = False
         self._local_region_radius: float = 50.0
+
+    def _set_cursor(self, cursor) -> None:
+        """Track desired cursor and update override cursor if active."""
+        self._current_cursor = cursor
+        if self._override_pushed:
+            QApplication.restoreOverrideCursor()
+            QApplication.setOverrideCursor(cursor)
+
+    # ---- diagnostics --------------------------------------------------------
+    _dbg_frame: int = 0
+
+    def _dbg_cursor(self, tag: str) -> None:
+        """Print cursor state every 60 mouse-move events to avoid console flood."""
+        self._dbg_frame += 1
+        if self._dbg_frame % 60 != 0:
+            return
+        vp_shape = self.viewport().cursor().shape()
+        override = QApplication.overrideCursor()
+        ov_shape = override.shape() if override is not None else "None"
+        want = self._current_cursor
+        want_shape = want.shape() if hasattr(want, 'shape') else want
+        print(
+            f"[cursor-dbg:{tag}] "
+            f"_current_cursor={want_shape}  "
+            f"viewport.cursor={vp_shape}  "
+            f"overrideCursor={ov_shape}  "
+            f"_override_pushed={self._override_pushed}"
+        )
+    # -------------------------------------------------------------------------
+
+    def enterEvent(self, event) -> None:
+        """Re-assert cursor on viewport when mouse enters — recovers after macOS fullscreen."""
+        super().enterEvent(event)
+        # Clear any stale application-level override cursors from fullscreen transitions
+        while QApplication.overrideCursor() is not None:
+            QApplication.restoreOverrideCursor()
+        self._override_pushed = False
+        # Push override cursor — maps to [NSCursor push] on macOS, which survives
+        # NSTrackingArea resets unlike widget-level setCursor().
+        QApplication.setOverrideCursor(self._current_cursor)
+        self._override_pushed = True
+
+    def leaveEvent(self, event) -> None:
+        """Pop override cursor when mouse leaves so it doesn't bleed into other widgets."""
+        super().leaveEvent(event)
+        if self._override_pushed:
+            QApplication.restoreOverrideCursor()
+            self._override_pushed = False
 
     def _forward_drag_event(self, event: QMouseEvent, button: Qt.MouseButton) -> None:
         """Forward a synthetic mouse event to Qt for native drag handling."""
@@ -680,7 +730,7 @@ class SlideGraphicsView(QGraphicsView):
         if event.button() == Qt.MouseButton.MiddleButton:
             print("DEBUG: Middle mouse button pressed for native panning")
             self.setDragMode(QGraphicsView.DragMode.ScrollHandDrag)
-            self.setCursor(Qt.CursorShape.OpenHandCursor)
+            self._set_cursor(Qt.CursorShape.OpenHandCursor)
             self._was_panning = True
             self._suppress_clicks = True
             # Forward as left button press to trigger Qt's native drag
@@ -798,7 +848,7 @@ class SlideGraphicsView(QGraphicsView):
             # Forward as left button release to complete Qt's native drag
             self._forward_drag_event(event, Qt.MouseButton.LeftButton)
             self.setDragMode(QGraphicsView.DragMode.NoDrag)
-            self.setCursor(Qt.CursorShape.CrossCursor)
+            self._set_cursor(Qt.CursorShape.CrossCursor)
             self._was_panning = False
             self._suppress_clicks = False
             return
@@ -816,6 +866,7 @@ class SlideGraphicsView(QGraphicsView):
         has_image = (self.pixmap_item is not None) or (self.tile_manager is not None)
         if not has_image or self.coords is None:
             super().mouseMoveEvent(event)
+            self._dbg_cursor("no-image")
             return
         
         scene_pos = self.mapToScene(event.position().toPoint())
@@ -834,7 +885,7 @@ class SlideGraphicsView(QGraphicsView):
             self.patch_hovered.emit(-1, False)
             super().mouseMoveEvent(event)
             return
-        
+
         x = scene_pos.x()
         y = scene_pos.y()
         if self.coords is None or len(self.coords) == 0 or self.labels is None or len(self.labels) == 0:
@@ -850,6 +901,7 @@ class SlideGraphicsView(QGraphicsView):
         # Emit hover signal with the index
         self.patch_hovered.emit(idx, True)
         super().mouseMoveEvent(event)
+        self._dbg_cursor("hover")
         
     def wheelEvent(self, event) -> None:
         """Zoom in/out on scroll wheel."""
@@ -908,7 +960,7 @@ class SlideGraphicsView(QGraphicsView):
         if enabled:
             self._update_radius_cursor()
         else:
-            self.setCursor(Qt.CursorShape.CrossCursor)
+            self._set_cursor(Qt.CursorShape.CrossCursor)
 
     def set_local_region_radius(self, radius: float) -> None:
         """Update the selection radius.
@@ -962,5 +1014,5 @@ class SlideGraphicsView(QGraphicsView):
 
         # Create cursor with hotspot at center
         cursor = QCursor(pixmap, cursor_diameter // 2, cursor_diameter // 2)
-        self.setCursor(cursor)
+        self._set_cursor(cursor)
 

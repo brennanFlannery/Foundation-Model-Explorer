@@ -48,6 +48,7 @@ dialog).
 from __future__ import annotations
 
 import os
+import re
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
@@ -111,6 +112,90 @@ class SlideInfo:
     # models[model][magnification][tile_size] = h5_file_path
 
 
+def _parse_trident_folder_name(folder: str) -> Optional[Tuple[str, str]]:
+    """Extract magnification and patch size from a Trident-style folder name.
+
+    Trident names follow the pattern ``<mag>_<patch>_...``, for example
+    ``20x_512px_0px_overlap``.  Returns a ``(magnification, patch_size)``
+    tuple such as ``("20x", "512px")``, or ``None`` if the name does not
+    match the expected pattern.
+    """
+    m = re.match(r'^(\d+x)_(\d+px)', folder)
+    if m:
+        return m.group(1), m.group(2)
+    return None
+
+
+def _detect_format(root_dir: str) -> str:
+    """Detect whether *root_dir* uses the legacy or Trident directory layout.
+
+    Returns ``"legacy"`` when a ``features/`` subdirectory is present,
+    ``"trident"`` when at least one subdirectory matches the Trident naming
+    pattern (e.g. ``20x_512px_0px_overlap``), and ``"legacy"`` as a safe
+    fallback otherwise.
+    """
+    if os.path.isdir(os.path.join(root_dir, 'features')):
+        return 'legacy'
+    for entry in os.listdir(root_dir):
+        if os.path.isdir(os.path.join(root_dir, entry)):
+            if _parse_trident_folder_name(entry) is not None:
+                return 'trident'
+    return 'legacy'
+
+
+def _parse_trident(root_dir: str, slide_files: Dict[str, str]) -> Dict[str, SlideInfo]:
+    """Parse a Trident-format directory into a mapping of slide name → SlideInfo.
+
+    Expected layout::
+
+        root_dir/
+            20x_512px_0px_overlap/
+                features_virchow2/
+                    slideA.h5
+                features_gigapath/
+                    slideA.h5
+
+    The magnification and patch size are read from the top-level folder name;
+    the model name is derived from the ``features_<model>`` subdirectory with
+    the ``features_`` prefix stripped.
+    """
+    slides: Dict[str, SlideInfo] = {}
+
+    for mag_patch_dir in sorted(os.listdir(root_dir)):
+        mag_patch_path = os.path.join(root_dir, mag_patch_dir)
+        if not os.path.isdir(mag_patch_path):
+            continue
+        result = _parse_trident_folder_name(mag_patch_dir)
+        if result is None:
+            continue
+        mag, patch = result
+
+        for model_dir in sorted(os.listdir(mag_patch_path)):
+            model_path = os.path.join(mag_patch_path, model_dir)
+            if not os.path.isdir(model_path):
+                continue
+            model_name = model_dir[9:] if model_dir.startswith('features_') else model_dir
+
+            for slide_name, image_path in slide_files.items():
+                h5_file = os.path.join(model_path, f"{slide_name}.h5")
+                if os.path.isfile(h5_file):
+                    if slide_name not in slides:
+                        slides[slide_name] = SlideInfo(
+                            name=slide_name,
+                            image_path=image_path,
+                            models={}
+                        )
+                    info = slides[slide_name]
+                    if model_name not in info.models:
+                        info.models[model_name] = {}
+                    if mag not in info.models[model_name]:
+                        info.models[model_name][mag] = {}
+                    info.models[model_name][mag][patch] = h5_file
+                    print(f"Found Trident features at: {h5_file}")
+
+    return slides
+
+
 def parse_root_directory(root_dir: str) -> Dict[str, SlideInfo]:
     """Parse the root directory to discover slides and feature files.
 
@@ -129,59 +214,55 @@ def parse_root_directory(root_dir: str) -> Dict[str, SlideInfo]:
     if not os.path.isdir(root_dir):
         raise ValueError(f"Root directory does not exist: {root_dir}")
 
-    # First find all SVS files
-    slide_files = {}
+    # Find all slide files at the root level
+    slide_files: Dict[str, str] = {}
     for fname in sorted(os.listdir(root_dir)):
         if fname.lower().endswith(('.svs', '.tif', '.tiff', '.ndpi')):
-            slide_name = os.path.splitext(fname)[0]  # Remove extension
+            slide_name = os.path.splitext(fname)[0]
             slide_files[slide_name] = os.path.join(root_dir, fname)
 
     if not slide_files:
         print(f"No slide files found in {root_dir}")
         return slides
 
-    # Check for features directory
+    print(f"Found slide files: {list(slide_files.keys())}")
+
+    fmt = _detect_format(root_dir)
+    print(f"Detected directory format: {fmt}")
+
+    if fmt == 'trident':
+        return _parse_trident(root_dir, slide_files)
+
+    # --- Legacy format: features/model/mag/patch/slide.h5 ---
     features_dir = os.path.join(root_dir, 'features')
     if not os.path.isdir(features_dir):
         print(f"No features directory found in {root_dir}")
         return slides
 
-    # Debug prints
-    print(f"Found slide files: {list(slide_files.keys())}")
-    
-    # For each slide, look for corresponding feature files
     for slide_name, image_path in slide_files.items():
         print(f"Looking for features for slide: {slide_name}")
         models: Dict[str, Dict[str, Dict[str, str]]] = {}
-        
-        # Scan through feature directories (model directories)
+
         for model_dir in sorted(os.listdir(features_dir)):
             model_path = os.path.join(features_dir, model_dir)
             if not os.path.isdir(model_path):
                 continue
-                
-            # Remove 'features_' prefix from model name if present
-            model_name = model_dir
-            if model_name.startswith('features_'):
-                model_name = model_name[9:]
-                
+
+            model_name = model_dir[9:] if model_dir.startswith('features_') else model_dir
             models[model_name] = {}
-            
-            # Scan through magnification directories
+
             for mag_dir in sorted(os.listdir(model_path)):
                 mag_path = os.path.join(model_path, mag_dir)
                 if not os.path.isdir(mag_path):
                     continue
-                    
+
                 models[model_name][mag_dir] = {}
-                
-                # Scan through patch size directories
+
                 for patch_dir in sorted(os.listdir(mag_path)):
                     patch_path = os.path.join(mag_path, patch_dir)
                     if not os.path.isdir(patch_path):
                         continue
-                        
-                    # Look for the H5 file matching the slide name
+
                     h5_file = os.path.join(patch_path, f"{slide_name}.h5")
                     if os.path.isfile(h5_file):
                         models[model_name][mag_dir][patch_dir] = h5_file
@@ -189,7 +270,7 @@ def parse_root_directory(root_dir: str) -> Dict[str, SlideInfo]:
                     else:
                         print(f"No features found for: {slide_name}")
 
-        if models:  # Only add slides that have feature files
+        if models:
             slides[slide_name] = SlideInfo(
                 name=slide_name,
                 image_path=image_path,

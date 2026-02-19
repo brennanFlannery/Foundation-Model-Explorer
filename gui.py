@@ -148,6 +148,12 @@ class SelectionMode(Enum):
     LOCAL_REGION = "local"   # Click selects K-means cluster patches within radius
 
 
+class SourceMode(Enum):
+    """Source mode for labeled regions."""
+    KMEANS = "kmeans"
+    LOCAL  = "local"
+
+
 @dataclass
 class LocalRegionCluster:
     """Represents a user-defined local region cluster (subset of K-means cluster)."""
@@ -158,6 +164,25 @@ class LocalRegionCluster:
     color: QColor
     name: str
     kmeans_cluster: int  # the K-means cluster this region belongs to
+
+
+@dataclass
+class LabeledRegion:
+    """Unified annotation record from any analysis mode."""
+    region_id: int
+    name: str
+    color: QColor
+    patch_indices: Set[int]
+    source_mode: SourceMode
+    kmeans_cluster: int
+    center_point: Optional[Tuple[float, float]] = None
+    radius: Optional[float] = None
+    slide_name: Optional[str] = None
+
+    @property
+    def cluster_id(self) -> int:
+        """Backward-compatible alias for region_id."""
+        return self.region_id
 
 
 @dataclass
@@ -1305,6 +1330,176 @@ class LocalRegionWidget(QWidget):
         return super().eventFilter(obj, event)
 
 
+class LabeledRegionsWidget(QWidget):
+    """Persistent sidebar panel showing all labeled regions across modes.
+
+    Displays a unified list of labeled regions from K-means and Local Region
+    modes, always visible below the tab widget.
+    """
+
+    region_clicked      = Signal(int)  # region_id
+    region_deleted      = Signal(int)  # region_id
+    export_requested    = Signal()
+    clear_all_requested = Signal()
+
+    def __init__(self, parent: Optional[QWidget] = None):
+        super().__init__(parent)
+        self._region_rows: Dict[int, QWidget] = {}
+        self._setup_ui()
+
+    def _setup_ui(self) -> None:
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(8, 6, 8, 6)
+        layout.setSpacing(4)
+
+        header = QLabel("Labeled Regions")
+        header.setStyleSheet("font-weight: bold; font-size: 10pt;")
+        layout.addWidget(header)
+
+        sep = QFrame()
+        sep.setFrameShape(QFrame.Shape.HLine)
+        sep.setFrameShadow(QFrame.Shadow.Sunken)
+        layout.addWidget(sep)
+
+        self._scroll = QScrollArea()
+        self._scroll.setWidgetResizable(True)
+        self._scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self._scroll.setFrameShape(QFrame.Shape.NoFrame)
+
+        self._content = QWidget()
+        self._content_layout = QVBoxLayout(self._content)
+        self._content_layout.setContentsMargins(0, 0, 0, 0)
+        self._content_layout.setSpacing(2)
+        self._content_layout.addStretch()
+
+        self._scroll.setWidget(self._content)
+        layout.addWidget(self._scroll, stretch=1)
+
+        btn_row = QHBoxLayout()
+        btn_row.setSpacing(4)
+
+        self.export_btn = QPushButton("Export All")
+        self.export_btn.setStyleSheet("font-size: 9pt;")
+        self.export_btn.clicked.connect(self.export_requested.emit)
+        self.export_btn.setEnabled(False)
+        btn_row.addWidget(self.export_btn)
+
+        self.clear_btn = QPushButton("Clear All")
+        self.clear_btn.setStyleSheet("font-size: 9pt;")
+        self.clear_btn.clicked.connect(self.clear_all_requested.emit)
+        self.clear_btn.setEnabled(False)
+        btn_row.addWidget(self.clear_btn)
+
+        layout.addLayout(btn_row)
+
+        self.setMinimumHeight(120)
+        self.setMaximumHeight(300)
+
+    def add_region(self, region: "LabeledRegion") -> None:
+        """Add a new region row to the list."""
+        row = QWidget()
+        row.setProperty("region_id", region.region_id)
+        row.setCursor(Qt.CursorShape.PointingHandCursor)
+        row.installEventFilter(self)
+
+        row_layout = QHBoxLayout(row)
+        row_layout.setContentsMargins(2, 2, 2, 2)
+        row_layout.setSpacing(4)
+
+        # Color square
+        color_square = QFrame()
+        color_square.setFixedSize(14, 14)
+        color_square.setStyleSheet(
+            f"background-color: {region.color.name()}; "
+            f"border: 1px solid #666; border-radius: 2px;"
+        )
+        row_layout.addWidget(color_square)
+
+        # Mode badge ("K" blue / "L" orange)
+        badge_text = "K" if region.source_mode == SourceMode.KMEANS else "L"
+        badge = QLabel(badge_text)
+        badge.setFixedWidth(16)
+        badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        if region.source_mode == SourceMode.KMEANS:
+            badge.setStyleSheet(
+                "background-color: #3a7bd5; color: white; font-size: 8pt; border-radius: 2px;"
+            )
+        else:
+            badge.setStyleSheet(
+                "background-color: #e08024; color: white; font-size: 8pt; border-radius: 2px;"
+            )
+        row_layout.addWidget(badge)
+
+        # Name label
+        label = QLabel(region.name)
+        label.setStyleSheet("font-size: 9pt;")
+        label.setObjectName("region_label")
+        row_layout.addWidget(label, stretch=1)
+
+        # Patch count
+        count_label = QLabel(f"({len(region.patch_indices):,})")
+        count_label.setStyleSheet("color: #888; font-size: 9pt;")
+        count_label.setObjectName("region_count")
+        row_layout.addWidget(count_label)
+
+        # Delete button
+        delete_btn = QPushButton("×")
+        delete_btn.setFixedSize(18, 18)
+        delete_btn.setStyleSheet(
+            "QPushButton { font-size: 12pt; color: #888; border: none; padding: 0; }"
+            "QPushButton:hover { color: #ff4444; }"
+        )
+        delete_btn.setToolTip("Delete region")
+        delete_btn.clicked.connect(lambda: self.region_deleted.emit(region.region_id))
+        row_layout.addWidget(delete_btn)
+
+        self._content_layout.insertWidget(self._content_layout.count() - 1, row)
+        self._region_rows[region.region_id] = row
+
+        self.export_btn.setEnabled(True)
+        self.clear_btn.setEnabled(True)
+
+    def remove_region(self, region_id: int) -> None:
+        """Remove a region row."""
+        row = self._region_rows.pop(region_id, None)
+        if row is not None:
+            row.deleteLater()
+        if not self._region_rows:
+            self.export_btn.setEnabled(False)
+            self.clear_btn.setEnabled(False)
+
+    def update_region(self, region_id: int, patch_count: int, name: Optional[str] = None) -> None:
+        """Update patch count (and optionally name) of an existing row."""
+        row = self._region_rows.get(region_id)
+        if row is None:
+            return
+        label = row.findChild(QLabel, "region_label")
+        if label is not None and name is not None:
+            label.setText(name)
+        count_label = row.findChild(QLabel, "region_count")
+        if count_label is not None:
+            count_label.setText(f"({patch_count:,})")
+
+    def clear_regions(self) -> None:
+        """Remove all region rows."""
+        for row in self._region_rows.values():
+            row.deleteLater()
+        self._region_rows.clear()
+        self.export_btn.setEnabled(False)
+        self.clear_btn.setEnabled(False)
+
+    def eventFilter(self, obj: QObject, event) -> bool:
+        """Handle mouse events on region rows."""
+        from PySide6.QtCore import QEvent
+        if event.type() == QEvent.Type.MouseButtonPress:
+            region_id = obj.property("region_id")
+            if region_id is not None:
+                if event.button() == Qt.MouseButton.LeftButton:
+                    self.region_clicked.emit(region_id)
+                    return True
+        return super().eventFilter(obj, event)
+
+
 class AtlasSlideListWidget(QWidget):
     """Widget for displaying and managing slides in the atlas builder.
 
@@ -2272,11 +2467,23 @@ class MainWindow(QMainWindow):
         self._animation_in_progress: bool = False
         # Local region selection mode state
         self._selection_mode: SelectionMode = SelectionMode.KMEANS
-        self._local_region_clusters: Dict[int, LocalRegionCluster] = {}
-        self._next_local_cluster_id: int = 0
+        self._labeled_regions: Dict[int, LabeledRegion] = {}
+        self._next_region_id: int = 0
+        self._last_labeled_slide: Optional[str] = None
         self._local_region_radius: float = 50.0
         self._update_model_selection_label()
         self._set_model_dependent_ui_enabled(False)
+
+    @property
+    def _local_region_clusters(self) -> Dict[int, "LabeledRegion"]:
+        """Read-only backward-compat view of LOCAL-mode labeled regions."""
+        return {rid: r for rid, r in self._labeled_regions.items()
+                if r.source_mode == SourceMode.LOCAL}
+
+    @property
+    def _next_local_cluster_id(self) -> int:
+        """Backward-compat alias for _next_region_id."""
+        return self._next_region_id
 
     def _create_widgets(self) -> None:
         """Create and lay out widgets for the main window."""
@@ -2450,8 +2657,23 @@ class MainWindow(QMainWindow):
         self.atlas_thumbnail_panel.setVisible(False)
         self.atlas_thumbnail_panel.slide_clicked.connect(self._on_atlas_thumbnail_clicked)
 
+        # Sidebar container: tab widget + always-visible labeled regions panel
+        sidebar_container = QWidget()
+        sidebar_vbox = QVBoxLayout(sidebar_container)
+        sidebar_vbox.setContentsMargins(0, 0, 0, 0)
+        sidebar_vbox.setSpacing(0)
+        sidebar_vbox.addWidget(self.sidebar_tabs, stretch=1)
+        sidebar_sep = QFrame()
+        sidebar_sep.setFrameShape(QFrame.Shape.HLine)
+        sidebar_vbox.addWidget(sidebar_sep)
+        self.labeled_regions_widget = LabeledRegionsWidget()
+        self.labeled_regions_widget.region_deleted.connect(self._on_labeled_region_deleted_from_panel)
+        self.labeled_regions_widget.clear_all_requested.connect(self._clear_all_labeled_regions)
+        self.labeled_regions_widget.export_requested.connect(self._export_labeled_regions)
+        sidebar_vbox.addWidget(self.labeled_regions_widget, stretch=0)
+
         splitter = QSplitter(Qt.Horizontal)
-        splitter.addWidget(self.sidebar_tabs)
+        splitter.addWidget(sidebar_container)
         splitter.addWidget(self.atlas_thumbnail_panel)
         splitter.addWidget(self.graphics_view)
         splitter.setStretchFactor(0, 0)  # sidebar: no stretch
@@ -2564,7 +2786,14 @@ class MainWindow(QMainWindow):
         self.export_action.setEnabled(False)  # Enable when cluster selected
         self.export_action.triggered.connect(self._on_export_clicked)
         file_menu.addAction(self.export_action)
-        
+
+        # Export all labeled regions (unified)
+        self.export_labeled_action = QAction("Export Labeled Regions as GeoJSON...", self)
+        self.export_labeled_action.setShortcut("Ctrl+Shift+E")
+        self.export_labeled_action.setEnabled(False)
+        self.export_labeled_action.triggered.connect(self._export_labeled_regions)
+        file_menu.addAction(self.export_labeled_action)
+
         file_menu.addSeparator()
         
         # Preferences
@@ -2838,6 +3067,7 @@ class MainWindow(QMainWindow):
         """Enable or disable model-dependent UI elements."""
         self.cluster_legend.setEnabled(enabled)
         self.local_region_widget.setEnabled(enabled)
+        self.labeled_regions_widget.setEnabled(enabled)
         self.scatter_view.setEnabled(enabled)
         self.atlas_add_current_btn.setEnabled(enabled)
         self.cluster_spin.setEnabled(enabled)
@@ -2851,32 +3081,26 @@ class MainWindow(QMainWindow):
         self.scatter_view.cluster_colors = []
         self.scatter_view.set_animation_active(False)
 
+    def _show_toast(self, message: str) -> None:
+        """Show a short-lived floating toast message near the cursor."""
+        if self._preview_toast is None:
+            self._preview_toast = QLabel(self)
+            self._preview_toast.setStyleSheet(
+                "QLabel { background-color: rgba(30,30,30,200); color: white;"
+                "padding: 6px 10px; border-radius: 6px; font-size: 10pt; }"
+            )
+        self._preview_toast.setText(message)
+        self._preview_toast.adjustSize()
+        self._preview_toast.move(QCursor.pos() + QPoint(12, 12))
+        self._preview_toast.show()
+        self._preview_toast.raise_()
+        QTimer.singleShot(2000, self._preview_toast.hide)
+
     def _show_preview_blocked_toast(self) -> None:
         """Show a short-lived toast when preview interactions are blocked."""
         if self._model_selection is not None:
             return
-
-        if self._preview_toast is None:
-            self._preview_toast = QLabel(self)
-            self._preview_toast.setStyleSheet(
-                "QLabel {"
-                "background-color: rgba(30, 30, 30, 200);"
-                "color: white;"
-                "padding: 6px 10px;"
-                "border-radius: 6px;"
-                "font-size: 10pt;"
-                "}"
-            )
-        self._preview_toast.setText("No model selected")
-        self._preview_toast.adjustSize()
-
-        cursor_pos = QCursor.pos()
-        toast_pos = cursor_pos + QPoint(12, 12)
-        self._preview_toast.move(toast_pos)
-        self._preview_toast.show()
-        self._preview_toast.raise_()
-
-        QTimer.singleShot(2000, self._preview_toast.hide)
+        self._show_toast("No model selected")
 
     def _load_slide_image_only(self, slide_name: str) -> None:
         """Load a slide preview without clustering."""
@@ -3187,11 +3411,8 @@ class MainWindow(QMainWindow):
         print(f"DEBUG: Scatter cluster selected {cluster}")
         if self.graphics_view.labels is None:
             return
-        if ctrl_pressed:
-            if not self._add_selected_cluster(cluster):
-                return
-        else:
-            self._set_selected_clusters({cluster})
+        if not self._create_kmeans_labeled_region(cluster):
+            return
         # Prepare scatter baseline for cascade
         self._prepare_scatter_for_cascade(cluster)
         # Use the first patch's center as click point approximate
@@ -3206,16 +3427,17 @@ class MainWindow(QMainWindow):
         """Handle left-click on cluster in legend - trigger cascade from centroid."""
         print(f"DEBUG: Legend cluster clicked {cluster}")
 
-        # Validate data is loaded
-        self._animation_in_progress = True
-        self._animation_in_progress = True
         if self.graphics_view.labels is None or self.graphics_view.coords is None:
             return
-
+        if not self._create_kmeans_labeled_region(cluster):
+            return
+        cluster_indices = np.where(self.graphics_view.labels == cluster)[0]
+        if cluster_indices.size == 0:
+            return
         cluster_coords = self.graphics_view.coords[cluster_indices]
         centroid_x = cluster_coords[:, 0].mean() + self.graphics_view.patch_size / 2.0
         centroid_y = cluster_coords[:, 1].mean() + self.graphics_view.patch_size / 2.0
-
+        self._prepare_scatter_for_cascade(cluster)
         self._start_slide_cascade(cluster, (centroid_x, centroid_y))
 
     def _on_legend_cluster_toggled(self, cluster: int, checked: bool) -> None:
@@ -3223,20 +3445,18 @@ class MainWindow(QMainWindow):
         if self.graphics_view.labels is None or self.graphics_view.coords is None:
             return
         if checked:
-            if not self._add_selected_cluster(cluster):
+            if not self._create_kmeans_labeled_region(cluster):
                 return
             self._prepare_scatter_for_cascade(cluster)
             cluster_indices = np.where(self.graphics_view.labels == cluster)[0]
             if cluster_indices.size == 0:
                 return
             cluster_coords = self.graphics_view.coords[cluster_indices]
-            centroid_x = cluster_coords[:, 0].mean() + self.graphics_view.patch_size / 2.0
-            centroid_y = cluster_coords[:, 1].mean() + self.graphics_view.patch_size / 2.0
-            self._start_slide_cascade(cluster, (centroid_x, centroid_y))
+            cx = cluster_coords[:, 0].mean() + self.graphics_view.patch_size / 2.0
+            cy = cluster_coords[:, 1].mean() + self.graphics_view.patch_size / 2.0
+            self._start_slide_cascade(cluster, (cx, cy))
         else:
-            if self._remove_selected_cluster(cluster):
-                if not self._animation_in_progress:
-                    self._apply_selected_cluster_styles()
+            self._delete_kmeans_labeled_region(cluster)
 
     def _on_rename_cluster(self, cluster: int) -> None:
         """Handle rename cluster request from legend context menu."""
@@ -3512,11 +3732,8 @@ class MainWindow(QMainWindow):
         if not hasattr(self, '_current_features'):
             return
         print(f"DEBUG: Preparing scatter for synchronized cascade, cluster {cluster}")
-        if ctrl_pressed:
-            if not self._add_selected_cluster(cluster):
-                return
-        else:
-            self._set_selected_clusters({cluster})
+        if not self._create_kmeans_labeled_region(cluster):
+            return
         self._prepare_scatter_for_cascade(cluster)
         self._start_slide_cascade(cluster, click_point)
 
@@ -3587,7 +3804,7 @@ class MainWindow(QMainWindow):
         if self._selection_mode == SelectionMode.LOCAL_REGION:
             self._apply_local_region_cluster_styles()
         else:
-            self._apply_selected_cluster_styles()
+            self._apply_all_labeled_region_styles()
 
     def _merge_cluster_patches(self, cluster: int) -> List[List]:
         """Merge adjacent patches into continuous polygons.
@@ -3965,6 +4182,14 @@ class MainWindow(QMainWindow):
                 label = int(self.graphics_view.labels[i])
                 rect.setOpacity(selected_opacity if label in self._selected_clusters else 0.0)
 
+        # Restore labeled regions so they stay visible during K-means selection
+        for region in self._labeled_regions.values():
+            for idx in region.patch_indices:
+                if 0 <= idx < len(self.graphics_view.rect_items):
+                    rect = self.graphics_view.rect_items[idx]
+                    rect.setBrush(QBrush(region.color))
+                    rect.setOpacity(0.55)
+
     def _load_current_data(self, recluster_only: bool = False) -> None:
         """Load or recompute data based on current selections.
 
@@ -3975,6 +4200,8 @@ class MainWindow(QMainWindow):
             when the cluster count changes) without reloading images
             or coordinates.  Defaults to False.
         """
+        # Preserve selection so it can be restored after atlas labels are applied
+        _prev_selected = set(self._selected_clusters)
         # Reset selected clusters and disable export action when loading new data
         self._clear_selected_clusters()
         self._animation_in_progress = False
@@ -4004,7 +4231,40 @@ class MainWindow(QMainWindow):
         if info is None:
             print(f"DEBUG: Slide info not found for {slide_name}")
             return
-        
+
+        # --- Slide-switch safety: warn if labeled regions exist for a different slide ---
+        if (not recluster_only
+                and self._labeled_regions
+                and self._last_labeled_slide is not None
+                and self._last_labeled_slide != slide_name):
+            ans = QMessageBox.question(
+                self, "Switch Slide",
+                "Switching slides will clear all labeled regions. Continue?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if ans != QMessageBox.StandardButton.Yes:
+                return
+            self._clear_all_labeled_regions()
+
+        # --- Recluster safety: warn if K-means labeled regions exist ---
+        if recluster_only:
+            kmeans_regions = [r for r in self._labeled_regions.values()
+                              if r.source_mode == SourceMode.KMEANS]
+            if kmeans_regions:
+                ans = QMessageBox.question(
+                    self, "Change K",
+                    f"Changing the cluster count will invalidate "
+                    f"{len(kmeans_regions)} K-means labeled region(s). Remove them?",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                    QMessageBox.StandardButton.Yes,
+                )
+                if ans == QMessageBox.StandardButton.Yes:
+                    for region in kmeans_regions:
+                        del self._labeled_regions[region.region_id]
+                        self.labeled_regions_widget.remove_region(region.region_id)
+                    self._update_labeled_export_action()
+
         # If not reclustering, load features and image afresh
         if not recluster_only or self.graphics_view.coords is None:
             # Show progress bar
@@ -4170,6 +4430,13 @@ class MainWindow(QMainWindow):
             # If atlas is active for this slide, apply atlas labels/colors over local ones
             if self._is_atlas_active():
                 self._apply_atlas_to_views()
+                # Re-apply cluster highlight if a selection was active before the slide switch
+                if _prev_selected:
+                    self._set_selected_clusters(_prev_selected)
+                    self._apply_selected_cluster_styles()
+                    self.atlas_thumbnail_panel.highlight_cluster(
+                        next(iter(_prev_selected)), _prev_selected
+                    )
             # Hide progress bar when done
             self.progress_bar.setVisible(False)
         else:
@@ -4200,6 +4467,13 @@ class MainWindow(QMainWindow):
             # If atlas is active for this slide, re-apply atlas overlay
             if self._is_atlas_active():
                 self._apply_atlas_to_views()
+                # Re-apply cluster highlight if a selection was active before the slide switch
+                if _prev_selected:
+                    self._set_selected_clusters(_prev_selected)
+                    self._apply_selected_cluster_styles()
+                    self.atlas_thumbnail_panel.highlight_cluster(
+                        next(iter(_prev_selected)), _prev_selected
+                    )
     
     def _compute_centroids(self, features: np.ndarray, labels: np.ndarray) -> np.ndarray:
         """Compute centroid of each cluster in feature space.
@@ -4521,7 +4795,29 @@ class MainWindow(QMainWindow):
         if not self._scatter_positioned:
             self._scatter_positioned = True
             self._snap_scatter_dock_to_corner()
-    
+
+    def changeEvent(self, event) -> None:
+        from PySide6.QtCore import QEvent
+        super().changeEvent(event)
+        if event.type() == QEvent.Type.WindowStateChange:
+            # Delay to let macOS fullscreen/zoom animation complete before restoring cursors
+            QTimer.singleShot(500, self._restore_view_cursors)
+
+    def _restore_view_cursors(self) -> None:
+        """Re-assert custom cursors after macOS fullscreen/maximize resets them."""
+        # Clear all stale application-level override cursors
+        while QApplication.overrideCursor() is not None:
+            QApplication.restoreOverrideCursor()
+        for view in (self.graphics_view, self.scatter_view, self.atlas_scatter_view):
+            if hasattr(view, '_current_cursor'):
+                view._override_pushed = False
+                vp = view.viewport()
+                # Edge case: mouse was already inside a view before/during fullscreen transition
+                # (enterEvent won't fire again). Use underMouse() to detect and push override.
+                if vp.underMouse():
+                    QApplication.setOverrideCursor(view._current_cursor)
+                    view._override_pushed = True
+
     def closeEvent(self, event) -> None:
         """Handle application close event and clean up resources."""
         print("DEBUG: Application closing, cleaning up resources")
@@ -4602,6 +4898,7 @@ class MainWindow(QMainWindow):
         if index == 0:  # K-means tab — always use local groups
             self._set_selection_mode(SelectionMode.KMEANS)
             self._restore_local_to_views()
+            self._apply_all_labeled_region_styles()   # re-paint after restore resets opacities
         elif index == 1:  # Local Region tab
             self._set_selection_mode(SelectionMode.LOCAL_REGION)
             if self._is_atlas_active():
@@ -4609,6 +4906,16 @@ class MainWindow(QMainWindow):
         else:  # Atlas tab (index 2) and any future tabs
             if self._is_atlas_active():
                 self._apply_atlas_to_views()
+        # In Local/Atlas tabs, paint any KMEANS-mode labeled regions on top
+        # (In K-means tab, _apply_selected_cluster_styles_to_slide handles this)
+        if index != 0 and self._labeled_regions and self.graphics_view.rect_items:
+            for _region in self._labeled_regions.values():
+                if _region.source_mode == SourceMode.KMEANS:
+                    for _idx in _region.patch_indices:
+                        if 0 <= _idx < len(self.graphics_view.rect_items):
+                            _rect = self.graphics_view.rect_items[_idx]
+                            _rect.setBrush(QBrush(_region.color))
+                            _rect.setOpacity(0.6)
 
     def _set_selection_mode(self, mode: SelectionMode) -> None:
         """Switch between K-means and Local Region selection modes."""
@@ -4908,13 +5215,13 @@ class MainWindow(QMainWindow):
             merged_radius = radius
 
             for region_id in connected_ids:
-                cluster = self._local_region_clusters.get(region_id)
+                cluster = self._labeled_regions.get(region_id)
                 if cluster is None:
                     continue
                 merged_indices.update(cluster.patch_indices)
                 merged_radius = max(merged_radius, cluster.radius)
 
-            primary_cluster = self._local_region_clusters.get(primary_id)
+            primary_cluster = self._labeled_regions.get(primary_id)
             if primary_cluster is None:
                 return
 
@@ -4925,6 +5232,7 @@ class MainWindow(QMainWindow):
             self.local_region_widget.update_region(
                 primary_id, len(merged_indices), primary_cluster.name
             )
+            self.labeled_regions_widget.update_region(primary_id, len(merged_indices))
 
             # Reapply styles to ensure all regions have correct opacities before cascade
             self._apply_local_region_cluster_styles()
@@ -4944,7 +5252,7 @@ class MainWindow(QMainWindow):
             for region_id in connected_ids:
                 if region_id == primary_id:
                     continue
-                cluster = self._local_region_clusters.get(region_id)
+                cluster = self._labeled_regions.get(region_id)
                 if cluster is None:
                     continue
                 new_indices -= cluster.patch_indices
@@ -4960,14 +5268,15 @@ class MainWindow(QMainWindow):
             for region_id in connected_ids:
                 if region_id == primary_id:
                     continue
-                if region_id in self._local_region_clusters:
-                    del self._local_region_clusters[region_id]
+                if region_id in self._labeled_regions:
+                    del self._labeled_regions[region_id]
                 self.local_region_widget.remove_region(region_id)
+                self.labeled_regions_widget.remove_region(region_id)
 
             return
 
-        cluster_id = self._next_local_cluster_id
-        self._next_local_cluster_id += 1
+        cluster_id = self._next_region_id
+        self._next_region_id += 1
 
         # Use K-means cluster color directly (no modification)
         if self.graphics_view.cluster_colors and kmeans_cluster < len(self.graphics_view.cluster_colors):
@@ -4975,22 +5284,29 @@ class MainWindow(QMainWindow):
         else:
             color = QColor(128, 128, 128)  # Fallback gray
 
-        # Create cluster data
-        cluster = LocalRegionCluster(
-            cluster_id=cluster_id,
+        slide_name = self.slide_combo.currentText() or None
+
+        # Create region as LabeledRegion
+        region = LabeledRegion(
+            region_id=cluster_id,
+            name=f"Region {cluster_id}",
+            color=color,
             patch_indices=patch_indices,
+            source_mode=SourceMode.LOCAL,
+            kmeans_cluster=kmeans_cluster,
             center_point=center_point,
             radius=radius,
-            color=color,
-            name=f"Region {cluster_id}",
-            kmeans_cluster=kmeans_cluster
+            slide_name=slide_name,
         )
-        self._local_region_clusters[cluster_id] = cluster
+        self._labeled_regions[cluster_id] = region
+        self._last_labeled_slide = slide_name
 
         # Update UI
         self.local_region_widget.add_region(
-            cluster_id, len(patch_indices), color, cluster.name
+            cluster_id, len(patch_indices), color, region.name
         )
+        self.labeled_regions_widget.add_region(region)
+        self._update_labeled_export_action()
 
         print(f"DEBUG: Created local region cluster {cluster_id} with {len(patch_indices)} patches")
 
@@ -5121,26 +5437,168 @@ class MainWindow(QMainWindow):
                 item.setOpacity(1.0)
 
     def _on_local_region_deleted(self, region_id: int) -> None:
-        """Handle deletion of a local region.
+        """Handle deletion of a local region (triggered from LocalRegionWidget).
 
         Parameters
         ----------
         region_id : int
             The region ID to delete.
         """
-        if region_id in self._local_region_clusters:
-            del self._local_region_clusters[region_id]
+        if region_id in self._labeled_regions:
+            del self._labeled_regions[region_id]
             self.local_region_widget.remove_region(region_id)
+            self.labeled_regions_widget.remove_region(region_id)
             self._apply_local_region_cluster_styles()
+            self._update_labeled_export_action()
             print(f"DEBUG: Deleted local region cluster {region_id}")
+
+    def _on_labeled_region_deleted_from_panel(self, region_id: int) -> None:
+        """Handle deletion triggered from the unified Labeled Regions panel.
+
+        Parameters
+        ----------
+        region_id : int
+            The region ID to delete.
+        """
+        region = self._labeled_regions.pop(region_id, None)
+        if region is None:
+            return
+        if region.source_mode == SourceMode.LOCAL:
+            self.local_region_widget.remove_region(region_id)
+        elif region.source_mode == SourceMode.KMEANS:
+            self._selected_clusters.discard(region.kmeans_cluster)
+            self._sync_legend_checkboxes()
+        self.labeled_regions_widget.remove_region(region_id)
+        self._apply_all_labeled_region_styles()
+        self._update_labeled_export_action()
+        print(f"DEBUG: Deleted labeled region {region_id} from panel")
 
     def _clear_local_region_clusters(self) -> None:
         """Clear all local region clusters."""
-        self._local_region_clusters.clear()
-        self._next_local_cluster_id = 0
+        local_ids = [rid for rid, r in self._labeled_regions.items()
+                     if r.source_mode == SourceMode.LOCAL]
+        for rid in local_ids:
+            del self._labeled_regions[rid]
+            self.labeled_regions_widget.remove_region(rid)
         self.local_region_widget.clear_regions()
         self._apply_local_region_cluster_styles()
+        self._update_labeled_export_action()
         print("DEBUG: Cleared all local region clusters")
+
+    def _clear_all_labeled_regions(self) -> None:
+        """Clear all labeled regions from all modes."""
+        self._labeled_regions.clear()
+        self._next_region_id = 0
+        self._selected_clusters.clear()
+        self.labeled_regions_widget.clear_regions()
+        self.local_region_widget.clear_regions()
+        self._sync_legend_checkboxes()
+        self._apply_all_labeled_region_styles()
+        self._update_labeled_export_action()
+        print("DEBUG: Cleared all labeled regions")
+
+    # -------------------------------------------------------------------------
+    # Unified labeled region style application
+    # -------------------------------------------------------------------------
+
+    def _update_labeled_export_action(self) -> None:
+        """Enable/disable the Export Labeled Regions menu action."""
+        if hasattr(self, 'export_labeled_action'):
+            self.export_labeled_action.setEnabled(bool(self._labeled_regions))
+
+    def _apply_all_labeled_region_styles(self) -> None:
+        """Apply styles for all labeled regions across all modes.
+
+        Hides all patches first, then illuminates patches belonging to any
+        labeled region with their region color.
+        """
+        if not self.graphics_view.rect_items:
+            return
+
+        # Reset all patches to invisible
+        for rect in self.graphics_view.rect_items:
+            rect.setOpacity(0.0)
+
+        # Illuminate patches for each labeled region
+        for region in self._labeled_regions.values():
+            for idx in region.patch_indices:
+                if 0 <= idx < len(self.graphics_view.rect_items):
+                    rect = self.graphics_view.rect_items[idx]
+                    rect.setBrush(QBrush(region.color))
+                    rect.setOpacity(0.6)
+
+        self._apply_all_labeled_region_scatter_styles()
+
+    def _apply_all_labeled_region_scatter_styles(self) -> None:
+        """Apply scatter point styles for all labeled regions."""
+        if not self.scatter_view or not self.scatter_view._scatter_items:
+            return
+
+        all_labeled_indices: Set[int] = set()
+        for region in self._labeled_regions.values():
+            all_labeled_indices.update(region.patch_indices)
+
+        for item in self.scatter_view._scatter_items:
+            if item.index in all_labeled_indices:
+                item.setOpacity(1.0)
+            else:
+                item.setOpacity(0.2)
+
+    # -------------------------------------------------------------------------
+    # K-means labeled region helpers
+    # -------------------------------------------------------------------------
+
+    def _create_kmeans_labeled_region(self, cluster: int) -> bool:
+        """Create a LabeledRegion for a K-means cluster immediately.
+
+        Returns True if the region was created, False if it already exists or
+        the cluster has no patches.
+        """
+        if self.graphics_view.labels is None:
+            return False
+        # Duplicate check
+        for region in self._labeled_regions.values():
+            if region.source_mode == SourceMode.KMEANS and region.kmeans_cluster == cluster:
+                self._show_toast("Region already exists")
+                return False
+        indices = set(int(i) for i in np.where(self.graphics_view.labels == cluster)[0])
+        if not indices:
+            return False
+        color = (self.graphics_view.cluster_colors[cluster]
+                 if self.graphics_view.cluster_colors and cluster < len(self.graphics_view.cluster_colors)
+                 else QColor(128, 128, 128))
+        region_id = self._next_region_id
+        self._next_region_id += 1
+        region = LabeledRegion(
+            region_id=region_id,
+            name=self.cluster_legend.get_cluster_name(cluster),
+            color=color,
+            patch_indices=indices,
+            source_mode=SourceMode.KMEANS,
+            kmeans_cluster=cluster,
+            slide_name=self.slide_combo.currentText() or None,
+        )
+        self._labeled_regions[region_id] = region
+        self._last_labeled_slide = region.slide_name
+        self._selected_clusters.add(cluster)
+        self.labeled_regions_widget.add_region(region)
+        self._sync_legend_checkboxes()
+        self._update_labeled_export_action()
+        print(f"DEBUG: Created K-means labeled region {region_id} for cluster {cluster}")
+        return True
+
+    def _delete_kmeans_labeled_region(self, cluster: int) -> None:
+        """Delete the LabeledRegion for the given K-means cluster, if it exists."""
+        for region_id, region in list(self._labeled_regions.items()):
+            if region.source_mode == SourceMode.KMEANS and region.kmeans_cluster == cluster:
+                del self._labeled_regions[region_id]
+                self._selected_clusters.discard(cluster)
+                self.labeled_regions_widget.remove_region(region_id)
+                self._sync_legend_checkboxes()
+                self._update_labeled_export_action()
+                self._apply_all_labeled_region_styles()
+                print(f"DEBUG: Deleted K-means labeled region {region_id} for cluster {cluster}")
+                break
 
     def _apply_local_region_cluster_styles(self) -> None:
         """Apply styling to show local region clusters."""
@@ -5262,6 +5720,85 @@ class MainWindow(QMainWindow):
             self,
             "Export Complete",
             f"Exported {len(features)} local regions to:\n{file_path}"
+        )
+
+    def _export_labeled_regions(self) -> None:
+        """Export all labeled regions (all modes) to a single GeoJSON file."""
+        if not self._labeled_regions:
+            QMessageBox.warning(self, "No Regions", "No labeled regions to export.")
+            return
+
+        file_path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Export Labeled Regions as GeoJSON",
+            "",
+            "GeoJSON Files (*.geojson);;All Files (*)"
+        )
+        if not file_path:
+            return
+
+        self._write_labeled_regions_geojson(file_path)
+
+    def _write_labeled_regions_geojson(self, file_path: str) -> None:
+        """Write all labeled regions to a GeoJSON file.
+
+        Parameters
+        ----------
+        file_path : str
+            Path to the output file.
+        """
+        if self._current_coords_lv0 is not None:
+            coords = self._current_coords_lv0
+            patch_size = self._current_patch_size_lv0
+        else:
+            coords = self.graphics_view.coords
+            patch_size = self.graphics_view.patch_size
+
+        if coords is None:
+            QMessageBox.warning(self, "Export Error", "No coordinate data available.")
+            return
+
+        features = []
+
+        for region in self._labeled_regions.values():
+            boxes = []
+            for idx in region.patch_indices:
+                if 0 <= idx < len(coords):
+                    x, y = coords[idx]
+                    boxes.append(box(x, y, x + patch_size, y + patch_size))
+
+            if boxes:
+                merged = unary_union(boxes)
+                color_hex = region.color.name()
+                feature = {
+                    "type": "Feature",
+                    "geometry": merged.__geo_interface__,
+                    "properties": {
+                        "classification": {
+                            "name": region.name,
+                            "colorRGB": int(color_hex.replace('#', ''), 16)
+                        },
+                        "region_id": region.region_id,
+                        "patch_count": len(region.patch_indices),
+                        "kmeans_cluster": region.kmeans_cluster,
+                        "source_mode": region.source_mode.value,
+                    }
+                }
+                features.append(feature)
+
+        geojson = {
+            "type": "FeatureCollection",
+            "features": features
+        }
+
+        with open(file_path, 'w') as f:
+            json.dump(geojson, f, indent=2)
+
+        print(f"DEBUG: Exported {len(features)} labeled regions to {file_path}")
+        QMessageBox.information(
+            self,
+            "Export Complete",
+            f"Exported {len(features)} labeled regions to:\n{file_path}"
         )
 
     # -------------------------------------------------------------------------

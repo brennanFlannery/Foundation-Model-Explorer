@@ -225,7 +225,9 @@ class ScatterGraphicsView(QGraphicsView):
         # Do not enable automatic hand drag; we will use a cross cursor
         self.setDragMode(QGraphicsView.DragMode.NoDrag)
         # Set a cross‑hair cursor for precise point selection
-        self.setCursor(Qt.CursorShape.CrossCursor)
+        self._current_cursor = Qt.CursorShape.CrossCursor
+        self._override_pushed: bool = False
+        self._set_cursor(Qt.CursorShape.CrossCursor)
         self._scatter_items: List[ScatterGraphicsItem] = []
         self.labels: Optional[np.ndarray] = None
         self.cluster_colors: List[QColor] = []
@@ -237,6 +239,35 @@ class ScatterGraphicsView(QGraphicsView):
         # Local region selection mode state
         self._local_region_mode: bool = False
         self._local_region_radius: float = 50.0
+
+    def _set_cursor(self, cursor) -> None:
+        """Set cursor on viewport (correct for QAbstractScrollArea) and track it."""
+        self._current_cursor = cursor
+        self.viewport().setCursor(cursor)
+        if self._override_pushed:
+            QApplication.restoreOverrideCursor()
+            QApplication.setOverrideCursor(cursor)
+
+    def enterEvent(self, event) -> None:
+        """Re-assert cursor on viewport when mouse enters — recovers after macOS fullscreen."""
+        super().enterEvent(event)
+        # Clear any stale application-level override cursors from fullscreen transitions
+        while QApplication.overrideCursor() is not None:
+            QApplication.restoreOverrideCursor()
+        self._override_pushed = False
+        self.viewport().unsetCursor()
+        self.viewport().setCursor(self._current_cursor)
+        # Push override cursor — maps to [NSCursor push] on macOS, which survives
+        # NSTrackingArea resets unlike widget-level setCursor().
+        QApplication.setOverrideCursor(self._current_cursor)
+        self._override_pushed = True
+
+    def leaveEvent(self, event) -> None:
+        """Pop override cursor when mouse leaves so it doesn't bleed into other widgets."""
+        super().leaveEvent(event)
+        if self._override_pushed:
+            QApplication.restoreOverrideCursor()
+            self._override_pushed = False
 
     def set_animation_active(self, active: bool) -> None:
         """Set whether a cascade animation is in progress."""
@@ -328,7 +359,7 @@ class ScatterGraphicsView(QGraphicsView):
         if event.button() == Qt.MouseButton.MiddleButton:
             print("DEBUG: Scatter view middle mouse button pressed for native panning")
             self.setDragMode(QGraphicsView.DragMode.ScrollHandDrag)
-            self.setCursor(Qt.CursorShape.OpenHandCursor)
+            self._set_cursor(Qt.CursorShape.OpenHandCursor)
             self._was_panning = True
             self._suppress_clicks = True
             # Forward as left button press to trigger Qt's native drag
@@ -351,7 +382,7 @@ class ScatterGraphicsView(QGraphicsView):
             # Forward as left button release to complete Qt's native drag
             self._forward_drag_event(event, Qt.MouseButton.LeftButton)
             self.setDragMode(QGraphicsView.DragMode.NoDrag)
-            self.setCursor(Qt.CursorShape.CrossCursor)
+            self._set_cursor(Qt.CursorShape.CrossCursor)
             self._was_panning = False
             self._suppress_clicks = False
             return
@@ -387,7 +418,7 @@ class ScatterGraphicsView(QGraphicsView):
         if enabled:
             self._update_radius_cursor()
         else:
-            self.setCursor(Qt.CursorShape.CrossCursor)
+            self._set_cursor(Qt.CursorShape.CrossCursor)
 
     def set_local_region_radius(self, radius: float) -> None:
         """Update the selection radius.
@@ -440,7 +471,7 @@ class ScatterGraphicsView(QGraphicsView):
 
         # Create cursor with hotspot at center
         cursor = QCursor(pixmap, cursor_diameter // 2, cursor_diameter // 2)
-        self.setCursor(cursor)
+        self._set_cursor(cursor)
 
     def _handle_local_region_click(self, scene_pos: QPointF) -> None:
         """Handle a click in local region mode.

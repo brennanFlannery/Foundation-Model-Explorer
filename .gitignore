@@ -35,6 +35,9 @@ Thumbs.db
 # Example data folder
 FM-Explorer-Examples/
 
+# Generated / output images
+Images/
+
 # Documentation and reports
 Reports/
 

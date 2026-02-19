@@ -26,6 +26,7 @@ import numpy as np
 from PySide6.QtCore import Qt, Signal, QPointF, QObject
 from PySide6.QtGui import QColor, QPainter, QBrush, QPen
 from PySide6.QtWidgets import (
+    QApplication,
     QGraphicsView,
     QGraphicsScene,
     QGraphicsEllipseItem,
@@ -126,12 +127,43 @@ class AtlasScatterView(QGraphicsView):
         self.setRenderHints(self.renderHints() | QPainter.Antialiasing)
         self.setTransformationAnchor(QGraphicsView.ViewportAnchor.AnchorUnderMouse)
         self.setDragMode(QGraphicsView.DragMode.NoDrag)
-        self.setCursor(Qt.CursorShape.CrossCursor)
+        self._current_cursor = Qt.CursorShape.CrossCursor
+        self._override_pushed: bool = False
+        self._set_cursor(Qt.CursorShape.CrossCursor)
 
         self._items: List[AtlasScatterItem] = []
         self._atlas: Optional[ClusterAtlas] = None
         self._highlighted_slide: Optional[int] = None
         self._highlighted_cluster: Optional[int] = None
+
+    def _set_cursor(self, cursor) -> None:
+        """Set cursor on viewport (correct for QAbstractScrollArea) and track it."""
+        self._current_cursor = cursor
+        self.viewport().setCursor(cursor)
+        if self._override_pushed:
+            QApplication.restoreOverrideCursor()
+            QApplication.setOverrideCursor(cursor)
+
+    def enterEvent(self, event) -> None:
+        """Re-assert cursor on viewport when mouse enters — recovers after macOS fullscreen."""
+        super().enterEvent(event)
+        # Clear any stale application-level override cursors from fullscreen transitions
+        while QApplication.overrideCursor() is not None:
+            QApplication.restoreOverrideCursor()
+        self._override_pushed = False
+        self.viewport().unsetCursor()
+        self.viewport().setCursor(self._current_cursor)
+        # Push override cursor — maps to [NSCursor push] on macOS, which survives
+        # NSTrackingArea resets unlike widget-level setCursor().
+        QApplication.setOverrideCursor(self._current_cursor)
+        self._override_pushed = True
+
+    def leaveEvent(self, event) -> None:
+        """Pop override cursor when mouse leaves so it doesn't bleed into other widgets."""
+        super().leaveEvent(event)
+        if self._override_pushed:
+            QApplication.restoreOverrideCursor()
+            self._override_pushed = False
 
     def populate(self, atlas: 'ClusterAtlas') -> None:
         """Populate the scatter view with atlas data.
@@ -285,7 +317,7 @@ class AtlasScatterView(QGraphicsView):
         """Handle mouse press for panning with middle button."""
         if event.button() == Qt.MouseButton.MiddleButton:
             self.setDragMode(QGraphicsView.DragMode.ScrollHandDrag)
-            self.setCursor(Qt.CursorShape.ClosedHandCursor)
+            self._set_cursor(Qt.CursorShape.ClosedHandCursor)
             # Create a synthetic left-button event for Qt's drag handling
             from PySide6.QtGui import QMouseEvent
             from PySide6.QtCore import QEvent
@@ -305,7 +337,7 @@ class AtlasScatterView(QGraphicsView):
         """Handle mouse release to end panning."""
         if event.button() == Qt.MouseButton.MiddleButton:
             self.setDragMode(QGraphicsView.DragMode.NoDrag)
-            self.setCursor(Qt.CursorShape.CrossCursor)
+            self._set_cursor(Qt.CursorShape.CrossCursor)
             # Create synthetic release event
             from PySide6.QtGui import QMouseEvent
             from PySide6.QtCore import QEvent
