@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Literal, Optional, Tuple
 
 import numpy as np
 import h5py
@@ -698,6 +698,33 @@ _CLUSTER_STATS = {
     "width_mm": _stat_width_mm,
 }
 
+RegionMetric = Literal[
+    "spread",
+    "area_covered",
+    "area_bbox",
+    "area_hull",
+    "homogeneity",
+    "global_distance",
+    "pca_extent",
+    "top_dims",
+    "area_mm2",
+    "width_mm",
+]
+
+ClusterMetric = Literal[
+    "spread",
+    "area_covered",
+    "area_bbox",
+    "area_hull",
+    "homogeneity",
+    "pca_extent",
+    "patch_count",
+    "area_mm2",
+    "width_mm",
+    "separation",
+    "discriminating_dims",
+]
+
 
 @mcp.tool()
 def list_labeled_regions() -> Dict[str, Any]:
@@ -742,12 +769,12 @@ def list_labeled_regions() -> Dict[str, Any]:
 
 
 @mcp.tool()
-def compute_region_stats(region_id: int, metrics: List[str]) -> Dict[str, Any]:
+def compute_region_stats(region_id: int, metrics: List[RegionMetric]) -> Dict[str, Any]:
     """Compute selected statistics for a labeled region.
 
     Pass only the metrics you need to keep LLM context concise.
     Available metrics: spread, area_covered, area_bbox, area_hull,
-    homogeneity, global_distance, pca_extent, top_dims.
+    homogeneity, global_distance, pca_extent, top_dims, area_mm2, width_mm.
     Unrecognised metric names are collected in unknown_metrics — no crash.
     """
     state = app_state.get()
@@ -775,6 +802,24 @@ def compute_region_stats(region_id: int, metrics: List[str]) -> Dict[str, Any]:
         "computed": computed,
         "unknown_metrics": unknown,
     }
+
+
+@mcp.tool()
+def compute_region_geometry_stats(region_id: int) -> Dict[str, Any]:
+    """Compute a geometry-focused metric bundle for one labeled region."""
+    return compute_region_stats(
+        region_id=region_id,
+        metrics=["area_covered", "area_bbox", "area_hull", "area_mm2", "width_mm"],
+    )
+
+
+@mcp.tool()
+def compute_region_feature_stats(region_id: int) -> Dict[str, Any]:
+    """Compute a feature-focused metric bundle for one labeled region."""
+    return compute_region_stats(
+        region_id=region_id,
+        metrics=["spread", "homogeneity", "global_distance", "pca_extent", "top_dims"],
+    )
 
 
 @mcp.tool()
@@ -850,12 +895,12 @@ def find_similar_patches(
 
 
 @mcp.tool()
-def compute_cluster_stats(cluster_id: int, metrics: List[str]) -> Dict[str, Any]:
+def compute_cluster_stats(cluster_id: int, metrics: List[ClusterMetric]) -> Dict[str, Any]:
     """Compute selected statistics for a K-means cluster.
 
     Pass only the metrics you need to keep LLM context concise.
-    Available metrics: spread, area_covered, area_bbox, area_hull,
-    patch_count, separation, discriminating_dims.
+    Available metrics: spread, area_covered, area_bbox, area_hull, homogeneity,
+    pca_extent, patch_count, area_mm2, width_mm, separation, discriminating_dims.
     Unrecognised metric names are collected in unknown_metrics — no crash.
     """
     state = app_state.get()
@@ -886,6 +931,24 @@ def compute_cluster_stats(cluster_id: int, metrics: List[str]) -> Dict[str, Any]
         "computed": computed,
         "unknown_metrics": unknown,
     }
+
+
+@mcp.tool()
+def compute_cluster_geometry_stats(cluster_id: int) -> Dict[str, Any]:
+    """Compute a geometry-focused metric bundle for one K-means cluster."""
+    return compute_cluster_stats(
+        cluster_id=cluster_id,
+        metrics=["patch_count", "area_covered", "area_bbox", "area_hull", "area_mm2", "width_mm"],
+    )
+
+
+@mcp.tool()
+def compute_cluster_feature_stats(cluster_id: int) -> Dict[str, Any]:
+    """Compute a feature-focused metric bundle for one K-means cluster."""
+    return compute_cluster_stats(
+        cluster_id=cluster_id,
+        metrics=["spread", "homogeneity", "pca_extent", "separation", "discriminating_dims"],
+    )
 
 
 @mcp.tool()
@@ -985,7 +1048,7 @@ def get_pca_info() -> Dict[str, Any]:
 
 
 @mcp.tool()
-def compare_selected_clusters(metrics: List[str]) -> Dict[str, Any]:
+def compare_selected_clusters(metrics: List[ClusterMetric]) -> Dict[str, Any]:
     """Run compute_cluster_stats for every currently selected cluster in one call.
 
     Returns a list of per-cluster results sorted by the first metric requested.

@@ -130,15 +130,6 @@ class PreferencesDialog(QDialog):
         model_row.addWidget(self.chat_model_combo, stretch=1)
         agent_layout.addLayout(model_row)
 
-        cmd_row = QHBoxLayout()
-        cmd_row.addWidget(QLabel("MCP server command:"))
-        self.chat_mcp_cmd_edit = QLineEdit()
-        self.chat_mcp_cmd_edit.setText(
-            self.settings.value("chat_mcp_server_cmd", "python mcp_server.py", type=str)
-        )
-        cmd_row.addWidget(self.chat_mcp_cmd_edit, stretch=1)
-        agent_layout.addLayout(cmd_row)
-
         timeout_row = QHBoxLayout()
         timeout_row.addWidget(QLabel("LLM timeout (s):"))
         self.chat_llm_timeout_spin = QSpinBox()
@@ -159,7 +150,7 @@ class PreferencesDialog(QDialog):
         help_text_agent = QLabel(
             "Chat uses LiteLLM with OpenAI-compatible settings. "
             "Provide a local .env file containing OPENAI_API_KEY. "
-            "MCP server command is launched as a local subprocess."
+            "MCP tools are served in-process by FoundationDetector."
         )
         help_text_agent.setWordWrap(True)
         help_text_agent.setStyleSheet("color: gray; font-size: 9pt;")
@@ -186,7 +177,6 @@ class PreferencesDialog(QDialog):
         self.settings.setValue("chat_enabled", self.chat_enabled_checkbox.isChecked())
         self.settings.setValue("chat_secrets_path", self.chat_secrets_path.text().strip())
         self.settings.setValue("chat_model", self.chat_model_combo.currentText().strip())
-        self.settings.setValue("chat_mcp_server_cmd", self.chat_mcp_cmd_edit.text().strip())
         self.settings.setValue("chat_llm_timeout_s", self.chat_llm_timeout_spin.value())
         self.settings.setValue("chat_tool_timeout_s", self.chat_tool_timeout_spin.value())
         super().accept()

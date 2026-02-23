@@ -4853,7 +4853,7 @@ class MainWindow(QMainWindow):
             self.chat_dock.set_status_text("Ready")
             self.chat_dock.set_busy(False)
 
-    def _on_chat_send_requested(self, text: str) -> None:
+    def _on_chat_send_requested(self, text: str, metadata: Optional[Dict[str, object]] = None) -> None:
         """Forward user chat message to worker with bounded app context."""
         if self._chat_worker is None:
             self.chat_dock.add_error(
@@ -4862,7 +4862,22 @@ class MainWindow(QMainWindow):
             )
             return
         self.chat_dock.add_user_message(text)
-        context = {"root_dir": self._root_dir}
+        slash_parse_error = (metadata or {}).get("slash_parse_error")
+        if slash_parse_error:
+            self.chat_dock.add_error(
+                "Slash command parse error",
+                str(slash_parse_error),
+            )
+            return
+
+        context = {
+            "root_dir": self._root_dir,
+            "has_slide_loaded": getattr(self, "_current_features", None) is not None,
+            "has_labeled_regions": bool(getattr(self, "_labeled_regions", {})),
+            "has_selected_clusters": bool(getattr(self, "_selected_clusters", set())),
+            "atlas_ready": getattr(self, "_cluster_atlas", None) is not None,
+            "slash_command": (metadata or {}).get("slash_command"),
+        }
         self.chat_submit_requested.emit(text, context)
 
     def _on_chat_cancel_requested(self) -> None:
@@ -4898,6 +4913,7 @@ class MainWindow(QMainWindow):
         """Finalize assistant response UI state and status line."""
         self.chat_dock.stop_typing_indicator()
         self.chat_dock.finish_assistant_message()
+        self.chat_dock.record_response_usage(usage)
         total_tokens = usage.get("total_tokens")
         if total_tokens is None:
             self.chat_dock.set_status_text(f"Done in {latency_ms} ms")

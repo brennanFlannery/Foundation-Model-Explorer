@@ -13,6 +13,8 @@ class FakeLLM:
         self._responses.append(response)
 
     def complete_with_tools(self, messages, tools, timeout_s):
+        if not self._responses:
+            return {"choices": [{"message": {"content": "No response queued"}}]}
         return self._responses.pop(0)
 
     def normalize_tool_calls(self, response):
@@ -71,6 +73,9 @@ def test_chat_agent_runs_tool_and_streams_response():
     worker._llm.queue_response(  # type: ignore[attr-defined]
         {"tool_calls": [{"call_id": "c1", "name": "list_data", "arguments": {}}]}
     )
+    worker._llm.queue_response(  # type: ignore[attr-defined]
+        {"choices": [{"message": {"content": "summary"}}]}
+    )
 
     worker.submit_user_message("Inspect", {"root_dir": "/tmp"})
 
@@ -99,3 +104,48 @@ def test_chat_agent_emits_error_for_disallowed_tool():
     worker.submit_user_message("Inspect", {"root_dir": "/tmp"})
 
     assert errors
+
+
+def test_chat_agent_forced_slash_tool_call():
+    config = ChatAgentConfig(model="gpt-4o-mini", api_key="test")
+    worker = ChatAgentWorker(config)
+    worker._llm = FakeLLM()  # type: ignore[attr-defined]
+    worker._mcp = FakeMCP()  # type: ignore[attr-defined]
+
+    started = []
+    worker.response_started.connect(lambda mid: started.append(mid))
+    worker._llm.queue_response(  # type: ignore[attr-defined]
+        {"choices": [{"message": {"content": "summary"}}]}
+    )
+
+    worker.submit_user_message(
+        "/data",
+        {
+            "root_dir": "/tmp",
+            "slash_command": {
+                "kind": "tool",
+                "tool_name": "list_data",
+                "arguments": {},
+            },
+        },
+    )
+
+    assert started
+
+
+def test_chat_agent_slash_help_short_circuit():
+    config = ChatAgentConfig(model="gpt-4o-mini", api_key="test")
+    worker = ChatAgentWorker(config)
+    worker._llm = FakeLLM()  # type: ignore[attr-defined]
+    worker._mcp = FakeMCP()  # type: ignore[attr-defined]
+
+    finished = []
+    worker.response_finished.connect(lambda _id, text, _usage, _lat: finished.append(text))
+
+    worker.submit_user_message(
+        "/tools",
+        {"root_dir": "/tmp", "slash_command": {"kind": "help", "raw": "/tools"}},
+    )
+
+    assert finished
+    assert "Slash commands:" in finished[0]
