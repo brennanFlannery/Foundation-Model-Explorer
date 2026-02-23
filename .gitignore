@@ -41,5 +41,8 @@ Images/
 # Documentation and reports
 Reports/
 
+# Planning docs
+Plans/
+
 # Exported annotation files
 *.geojson

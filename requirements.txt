@@ -21,3 +21,8 @@ shapely>=2.0.0
 
 # Optional: for unit testing
 pytest>=7.3.0
+
+# Chat agent and local tool protocol
+litellm>=1.51.0
+mcp>=1.0.0
+python-dotenv>=1.0.1

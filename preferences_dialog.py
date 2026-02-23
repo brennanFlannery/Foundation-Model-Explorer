@@ -8,13 +8,21 @@ This module provides a dialog for configuring application preferences,
 including feature normalization settings for multi-model analysis.
 """
 
+import os
+
 from PySide6.QtWidgets import (
     QDialog,
     QVBoxLayout,
+    QHBoxLayout,
     QCheckBox,
     QDialogButtonBox,
     QLabel,
     QGroupBox,
+    QLineEdit,
+    QPushButton,
+    QFileDialog,
+    QSpinBox,
+    QComboBox,
 )
 from PySide6.QtCore import QSettings
 
@@ -52,6 +60,7 @@ class PreferencesDialog(QDialog):
         self.setWindowTitle("Preferences")
         self.setMinimumWidth(400)
         self.settings = QSettings("FoundationDetector", "FoundationDetector")
+        default_secrets_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
         
         layout = QVBoxLayout(self)
         
@@ -79,6 +88,85 @@ class PreferencesDialog(QDialog):
         
         feature_group.setLayout(feature_layout)
         layout.addWidget(feature_group)
+
+        # AI Agent Group
+        agent_group = QGroupBox("AI Agent")
+        agent_layout = QVBoxLayout()
+
+        self.chat_enabled_checkbox = QCheckBox("Enable in-app chat agent")
+        self.chat_enabled_checkbox.setChecked(
+            self.settings.value("chat_enabled", True, type=bool)
+        )
+        agent_layout.addWidget(self.chat_enabled_checkbox)
+
+        secrets_row = QHBoxLayout()
+        secrets_row.addWidget(QLabel("Secrets (.env) path:"))
+        self.chat_secrets_path = QLineEdit()
+        self.chat_secrets_path.setText(
+            self.settings.value("chat_secrets_path", default_secrets_path, type=str)
+        )
+        browse_btn = QPushButton("Browse...")
+        browse_btn.clicked.connect(self._browse_secrets_path)
+        secrets_row.addWidget(self.chat_secrets_path, stretch=1)
+        secrets_row.addWidget(browse_btn)
+        agent_layout.addLayout(secrets_row)
+
+        model_row = QHBoxLayout()
+        model_row.addWidget(QLabel("Model:"))
+        self.chat_model_combo = QComboBox()
+        self.chat_model_combo.addItems([
+            "gpt-4o-mini",
+            "gpt-4o",
+            "claude-haiku-4-5-20251001",
+            "claude-sonnet-4-6",
+        ])
+        self.chat_model_combo.setEditable(True)
+        selected_model = self.settings.value("chat_model", "gpt-4o-mini", type=str)
+        index = self.chat_model_combo.findText(selected_model)
+        if index >= 0:
+            self.chat_model_combo.setCurrentIndex(index)
+        else:
+            self.chat_model_combo.setCurrentText(selected_model)
+        model_row.addWidget(self.chat_model_combo, stretch=1)
+        agent_layout.addLayout(model_row)
+
+        cmd_row = QHBoxLayout()
+        cmd_row.addWidget(QLabel("MCP server command:"))
+        self.chat_mcp_cmd_edit = QLineEdit()
+        self.chat_mcp_cmd_edit.setText(
+            self.settings.value("chat_mcp_server_cmd", "python mcp_server.py", type=str)
+        )
+        cmd_row.addWidget(self.chat_mcp_cmd_edit, stretch=1)
+        agent_layout.addLayout(cmd_row)
+
+        timeout_row = QHBoxLayout()
+        timeout_row.addWidget(QLabel("LLM timeout (s):"))
+        self.chat_llm_timeout_spin = QSpinBox()
+        self.chat_llm_timeout_spin.setRange(5, 600)
+        self.chat_llm_timeout_spin.setValue(
+            self.settings.value("chat_llm_timeout_s", 60, type=int)
+        )
+        timeout_row.addWidget(self.chat_llm_timeout_spin)
+        timeout_row.addWidget(QLabel("Tool timeout (s):"))
+        self.chat_tool_timeout_spin = QSpinBox()
+        self.chat_tool_timeout_spin.setRange(5, 600)
+        self.chat_tool_timeout_spin.setValue(
+            self.settings.value("chat_tool_timeout_s", 30, type=int)
+        )
+        timeout_row.addWidget(self.chat_tool_timeout_spin)
+        agent_layout.addLayout(timeout_row)
+
+        help_text_agent = QLabel(
+            "Chat uses LiteLLM with OpenAI-compatible settings. "
+            "Provide a local .env file containing OPENAI_API_KEY. "
+            "MCP server command is launched as a local subprocess."
+        )
+        help_text_agent.setWordWrap(True)
+        help_text_agent.setStyleSheet("color: gray; font-size: 9pt;")
+        agent_layout.addWidget(help_text_agent)
+
+        agent_group.setLayout(agent_layout)
+        layout.addWidget(agent_group)
         
         # Add stretch to push buttons to bottom
         layout.addStretch()
@@ -95,4 +183,21 @@ class PreferencesDialog(QDialog):
         """Save settings and close dialog."""
         # Save settings
         self.settings.setValue("normalize_features", self.normalize_checkbox.isChecked())
+        self.settings.setValue("chat_enabled", self.chat_enabled_checkbox.isChecked())
+        self.settings.setValue("chat_secrets_path", self.chat_secrets_path.text().strip())
+        self.settings.setValue("chat_model", self.chat_model_combo.currentText().strip())
+        self.settings.setValue("chat_mcp_server_cmd", self.chat_mcp_cmd_edit.text().strip())
+        self.settings.setValue("chat_llm_timeout_s", self.chat_llm_timeout_spin.value())
+        self.settings.setValue("chat_tool_timeout_s", self.chat_tool_timeout_spin.value())
         super().accept()
+
+    def _browse_secrets_path(self) -> None:
+        """Prompt user to select a .env file path."""
+        selected, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select .env File",
+            "",
+            "Env Files (*.env *.txt);;All Files (*)",
+        )
+        if selected:
+            self.chat_secrets_path.setText(selected)

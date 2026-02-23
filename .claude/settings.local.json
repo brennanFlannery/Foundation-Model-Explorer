@@ -6,7 +6,10 @@
       "Bash(python -m py_compile:*)",
       "Bash(grep:*)",
       "Bash(ls:*)",
-      "Bash(python3 -m py_compile:*)"
+      "Bash(python3 -m py_compile:*)",
+      "Bash(python:*)",
+      "Bash(source:*)",
+      "Bash(python3:*)"
     ]
   }
 }

@@ -86,6 +86,7 @@ from PySide6.QtCore import (
     QPropertyAnimation,
     QEasingCurve,
     QSize,
+    QThread,
     QThreadPool,
     QRunnable,
 )
@@ -140,6 +141,10 @@ from scatter_view import ScatterGraphicsItem, ScatterGraphicsView
 from slide_view import SlideGraphicsView
 from atlas_builder import AtlasBuilder, ClusterAtlas, SlideAtlasEntry
 from atlas_scatter_view import AtlasScatterView
+import app_state
+from app_state import LabeledRegionData
+from chat_agent import ChatAgentConfig, ChatAgentWorker
+from chat_dock import ChatDockWidget
 
 
 class SelectionMode(Enum):
@@ -1082,6 +1087,7 @@ class LocalRegionWidget(QWidget):
     region_deleted = Signal(int)         # Emits region ID for deletion
     clear_all_requested = Signal()       # Request to clear all regions
     export_requested = Signal()          # Request to export regions
+    full_slide_toggled = Signal(bool)    # Emits True when Full Slide mode enabled
 
     def __init__(self, parent: Optional[QWidget] = None):
         super().__init__(parent)
@@ -1114,10 +1120,22 @@ class LocalRegionWidget(QWidget):
         sep.setFrameShadow(QFrame.Shadow.Sunken)
         layout.addWidget(sep)
 
-        # Radius slider with label
+        # Full Slide checkbox — when checked, selects entire cluster (KMEANS mode)
+        self.full_slide_check = QCheckBox("Full Slide")
+        self.full_slide_check.setChecked(True)
+        self.full_slide_check.setStyleSheet("font-size: 9pt;")
+        self.full_slide_check.toggled.connect(self._on_full_slide_toggled)
+        layout.addWidget(self.full_slide_check)
+
+        # Slider row container — hidden when Full Slide is checked
+        self._slider_row_widget = QWidget()
+        slider_layout = QVBoxLayout(self._slider_row_widget)
+        slider_layout.setContentsMargins(0, 0, 0, 0)
+        slider_layout.setSpacing(4)
+
         radius_header = QLabel("Selection Radius:")
         radius_header.setStyleSheet("font-size: 9pt; margin-top: 4px;")
-        layout.addWidget(radius_header)
+        slider_layout.addWidget(radius_header)
 
         radius_row = QHBoxLayout()
         radius_row.setSpacing(8)
@@ -1136,7 +1154,9 @@ class LocalRegionWidget(QWidget):
         self.radius_label.setStyleSheet("font-size: 9pt;")
         radius_row.addWidget(self.radius_label)
 
-        layout.addLayout(radius_row)
+        slider_layout.addLayout(radius_row)
+        layout.addWidget(self._slider_row_widget)
+        self._slider_row_widget.setVisible(False)  # Hidden when Full Slide starts checked
 
         # Separator before regions list
         sep2 = QFrame()
@@ -1185,6 +1205,11 @@ class LocalRegionWidget(QWidget):
         # Set size constraints
         self.setMinimumWidth(150)
         self.setMaximumWidth(200)
+
+    def _on_full_slide_toggled(self, checked: bool) -> None:
+        """Handle Full Slide checkbox toggle — show/hide radius slider."""
+        self._slider_row_widget.setVisible(not checked)
+        self.full_slide_toggled.emit(checked)
 
     def _on_radius_changed(self, value: int) -> None:
         """Handle radius slider change."""
@@ -2428,6 +2453,10 @@ class MainWindow(QMainWindow):
     _on_export_clicked()
         Handle export button click for GeoJSON annotation export.
     """
+    chat_submit_requested = Signal(str, object)
+    chat_cancel_requested = Signal()
+    chat_shutdown_requested = Signal()
+
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("FoundationDetector (Offline)")
@@ -2439,9 +2468,13 @@ class MainWindow(QMainWindow):
         # Load preferences
         self.settings = QSettings("FoundationDetector", "FoundationDetector")
         self.normalize_features = self.settings.value("normalize_features", True, type=bool)
+        self._root_dir: str = ""
+        self._chat_thread: Optional[QThread] = None
+        self._chat_worker: Optional[ChatAgentWorker] = None
         # UI components
         self._create_widgets()
         self._connect_signals()
+        self._setup_chat_agent()
         # Track hover state for slide-rect overlay
         self._hovered_slide_rect_idx = None
         self._hover_prev_opacity = 0.0
@@ -2548,23 +2581,7 @@ class MainWindow(QMainWindow):
         self.sidebar_tabs.setMinimumWidth(160)
         self.sidebar_tabs.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
 
-        # Tab 1: K-means Clusters (existing ClusterLegendWidget)
-        kmeans_tab = QWidget()
-        kmeans_layout = QVBoxLayout(kmeans_tab)
-        kmeans_layout.setContentsMargins(0, 0, 0, 0)
-        self.cluster_legend = ClusterLegendWidget()
-        kmeans_layout.addWidget(self.cluster_legend)
-        kmeans_layout.addStretch()
-        self.sidebar_tabs.addTab(kmeans_tab, "K-means")
-
-        # Connect K-means legend signals
-        self.cluster_legend.cluster_clicked.connect(self._on_legend_cluster_clicked)
-        self.cluster_legend.cluster_toggled.connect(self._on_legend_cluster_toggled)
-        self.cluster_legend.cluster_rename.connect(self._on_rename_cluster)
-        self.cluster_legend.cluster_export.connect(self._on_export_single_cluster)
-        self.cluster_legend.export_all_requested.connect(self._on_export_all_clusters)
-
-        # Tab 2: Local Region Selection (new LocalRegionWidget)
+        # Tab 0: Local Region Selection / Full Slide toggle
         local_tab = QWidget()
         local_layout = QVBoxLayout(local_tab)
         local_layout.setContentsMargins(0, 0, 0, 0)
@@ -2579,6 +2596,7 @@ class MainWindow(QMainWindow):
         self.local_region_widget.region_deleted.connect(self._on_local_region_deleted)
         self.local_region_widget.clear_all_requested.connect(self._clear_local_region_clusters)
         self.local_region_widget.export_requested.connect(self._export_local_region_clusters)
+        self.local_region_widget.full_slide_toggled.connect(self._on_full_slide_toggled)
 
         # Tab 3: Cross-Slide Atlas
         atlas_tab = QWidget()
@@ -2750,6 +2768,27 @@ class MainWindow(QMainWindow):
         self.atlas_scatter_dock_action.setShortcut("Ctrl+4")
         self._view_menu.addAction(self.atlas_scatter_dock_action)
 
+        # Agent chat view in separate dock widget
+        self.chat_dock = ChatDockWidget(self)
+        self.chat_dock.setAllowedAreas(Qt.AllDockWidgetAreas)
+        self.chat_dock.setFeatures(
+            QDockWidget.DockWidgetMovable |
+            QDockWidget.DockWidgetFloatable |
+            QDockWidget.DockWidgetClosable
+        )
+        self.addDockWidget(Qt.RightDockWidgetArea, self.chat_dock)
+        self.chat_dock.setFloating(False)
+        self.chat_dock.resize(420, 420)
+        self.chat_dock.show()
+
+        self.chat_dock_action = self.chat_dock.toggleViewAction()
+        self.chat_dock_action.setText("Show Agent Chat")
+        self.chat_dock_action.setShortcut("Ctrl+5")
+        self._view_menu.addAction(self.chat_dock_action)
+
+        self.chat_dock.send_requested.connect(self._on_chat_send_requested)
+        self.chat_dock.cancel_requested.connect(self._on_chat_cancel_requested)
+
         # Initialize atlas-related state
         self._cluster_atlas: Optional[ClusterAtlas] = None
         self._atlas_builder: Optional[AtlasBuilder] = None
@@ -2867,6 +2906,7 @@ class MainWindow(QMainWindow):
         try:
             print("DEBUG: Attempting to parse directory...")
             self.slides = data_loader.parse_root_directory(directory)
+            self._root_dir = directory
             print(f"DEBUG: Found {len(self.slides)} slides: {list(self.slides.keys())}")
             
             # Populate slide combo
@@ -3065,7 +3105,6 @@ class MainWindow(QMainWindow):
 
     def _set_model_dependent_ui_enabled(self, enabled: bool) -> None:
         """Enable or disable model-dependent UI elements."""
-        self.cluster_legend.setEnabled(enabled)
         self.local_region_widget.setEnabled(enabled)
         self.labeled_regions_widget.setEnabled(enabled)
         self.scatter_view.setEnabled(enabled)
@@ -3133,8 +3172,6 @@ class MainWindow(QMainWindow):
                     slide_dimensions,
                 )
                 if adaptive_loaded:
-                    self.cluster_legend.clear_cluster_names()
-                    self.cluster_legend.update_clusters(np.zeros((0,), dtype=int), [])
                     self._clear_scatter_view()
                     self._current_embedding = None
                     self._current_features = None
@@ -3161,8 +3198,6 @@ class MainWindow(QMainWindow):
         empty_coords = np.zeros((0, 2), dtype=float)
         empty_labels = np.zeros((0,), dtype=int)
         self.graphics_view.load_slide(thumb_image, empty_coords, 0.0, empty_labels, [])
-        self.cluster_legend.clear_cluster_names()
-        self.cluster_legend.update_clusters(empty_labels, [])
         self._clear_scatter_view()
 
         self._current_embedding = None
@@ -3423,61 +3458,6 @@ class MainWindow(QMainWindow):
         x, y = self.graphics_view.coords[idx0] + self.graphics_view.patch_size / 2.0
         self._start_slide_cascade(cluster, (x, y))
 
-    def _on_legend_cluster_clicked(self, cluster: int, ctrl_pressed: bool) -> None:
-        """Handle left-click on cluster in legend - trigger cascade from centroid."""
-        print(f"DEBUG: Legend cluster clicked {cluster}")
-
-        if self.graphics_view.labels is None or self.graphics_view.coords is None:
-            return
-        if not self._create_kmeans_labeled_region(cluster):
-            return
-        cluster_indices = np.where(self.graphics_view.labels == cluster)[0]
-        if cluster_indices.size == 0:
-            return
-        cluster_coords = self.graphics_view.coords[cluster_indices]
-        centroid_x = cluster_coords[:, 0].mean() + self.graphics_view.patch_size / 2.0
-        centroid_y = cluster_coords[:, 1].mean() + self.graphics_view.patch_size / 2.0
-        self._prepare_scatter_for_cascade(cluster)
-        self._start_slide_cascade(cluster, (centroid_x, centroid_y))
-
-    def _on_legend_cluster_toggled(self, cluster: int, checked: bool) -> None:
-        """Handle checkbox toggle for cluster selection."""
-        if self.graphics_view.labels is None or self.graphics_view.coords is None:
-            return
-        if checked:
-            if not self._create_kmeans_labeled_region(cluster):
-                return
-            self._prepare_scatter_for_cascade(cluster)
-            cluster_indices = np.where(self.graphics_view.labels == cluster)[0]
-            if cluster_indices.size == 0:
-                return
-            cluster_coords = self.graphics_view.coords[cluster_indices]
-            cx = cluster_coords[:, 0].mean() + self.graphics_view.patch_size / 2.0
-            cy = cluster_coords[:, 1].mean() + self.graphics_view.patch_size / 2.0
-            self._start_slide_cascade(cluster, (cx, cy))
-        else:
-            self._delete_kmeans_labeled_region(cluster)
-
-    def _on_rename_cluster(self, cluster: int) -> None:
-        """Handle rename cluster request from legend context menu."""
-        current_name = self.cluster_legend.get_cluster_name(cluster)
-        new_name, ok = QInputDialog.getText(
-            self, "Rename Cluster", "Enter new name:",
-            text=current_name
-        )
-        if ok and new_name.strip():
-            self.cluster_legend.set_cluster_name(cluster, new_name.strip())
-            # Refresh legend display
-            if self._current_labels is not None and self.scatter_view.cluster_colors:
-                self.cluster_legend.update_clusters(
-                    self._current_labels,
-                    [self._qcolor_to_hsl_string(c) for c in self.scatter_view.cluster_colors]
-                )
-
-    def _on_export_single_cluster(self, cluster: int) -> None:
-        """Handle export single cluster request from legend context menu."""
-        self._export_single_cluster(cluster)
-
     def _on_export_all_clusters(self) -> None:
         """Export all clusters to a single GeoJSON file."""
         # Validate data
@@ -3523,7 +3503,7 @@ class MainWindow(QMainWindow):
                 color_rgb = -16776961  # Default blue
 
             # Get cluster name
-            cluster_name = self.cluster_legend.get_cluster_name(cluster)
+            cluster_name = f"Cluster {cluster}"
 
             # Create feature for each polygon in merged result
             for poly_coords in merged_coords:
@@ -3992,7 +3972,7 @@ class MainWindow(QMainWindow):
             polygons = self._merge_cluster_patches(cluster)
             if not polygons:
                 continue
-            cluster_name = self.cluster_legend.get_cluster_name(cluster)
+            cluster_name = f"Cluster {cluster}"
             color_rgb = self._get_cluster_color_rgb(cluster)
             features.extend(self._build_geojson_features(polygons, cluster_name, color_rgb))
 
@@ -4118,7 +4098,6 @@ class MainWindow(QMainWindow):
     def _set_selected_clusters(self, clusters: set[int]) -> None:
         """Replace selected clusters and sync UI state."""
         self._selected_clusters = set(clusters)
-        self._sync_legend_checkboxes()
         self._update_export_action()
 
     def _add_selected_cluster(self, cluster: int) -> bool:
@@ -4126,7 +4105,6 @@ class MainWindow(QMainWindow):
         if cluster in self._selected_clusters:
             return False
         self._selected_clusters.add(cluster)
-        self._sync_legend_checkboxes()
         self._update_export_action()
         return True
 
@@ -4135,22 +4113,13 @@ class MainWindow(QMainWindow):
         if cluster not in self._selected_clusters:
             return False
         self._selected_clusters.remove(cluster)
-        self._sync_legend_checkboxes()
         self._update_export_action()
         return True
 
     def _clear_selected_clusters(self) -> None:
         """Clear all selected clusters."""
         self._selected_clusters.clear()
-        self._sync_legend_checkboxes()
         self._update_export_action()
-
-    def _sync_legend_checkboxes(self) -> None:
-        """Sync legend checkbox states without triggering cascades."""
-        for cluster_id, checkbox in self.cluster_legend._checkboxes.items():
-            checkbox.blockSignals(True)
-            checkbox.setChecked(cluster_id in self._selected_clusters)
-            checkbox.blockSignals(False)
 
     def _apply_selected_cluster_styles(self) -> None:
         """Apply opacity styling to scatter points based on selected clusters."""
@@ -4264,6 +4233,7 @@ class MainWindow(QMainWindow):
                         del self._labeled_regions[region.region_id]
                         self.labeled_regions_widget.remove_region(region.region_id)
                     self._update_labeled_export_action()
+                    self._sync_app_state_regions()
 
         # If not reclustering, load features and image afresh
         if not recluster_only or self.graphics_view.coords is None:
@@ -4337,6 +4307,7 @@ class MainWindow(QMainWindow):
             try:
                 print("DEBUG: Computing PCA embedding of features")
                 self._current_embedding = pca.fit_transform(features)
+                self._current_pca = pca
                 print(f"DEBUG: PCA embedding shape: {self._current_embedding.shape}")
             except Exception as e:
                 print(f"DEBUG: Error computing PCA: {e}")
@@ -4350,9 +4321,13 @@ class MainWindow(QMainWindow):
                 from openslide import OpenSlide  # type: ignore
                 slide = OpenSlide(info.image_path)
                 slide_w, slide_h = slide.dimensions
+                raw_mpp = slide.properties.get("openslide.mpp-x")
+                self._current_mpp = float(raw_mpp) if raw_mpp is not None else None
+                slide.close()
                 print(f"DEBUG: OpenSlide returned dimensions {slide_w}x{slide_h}")
             except Exception:
                 # Fallback: infer from coordinate grid
+                self._current_mpp = None
                 print("DEBUG: Failed to use OpenSlide; inferring slide dimensions from patch coordinates")
                 slide_w, slide_h = infer_slide_dims(coords_lv0, patch_size_lv0)
                 print(f"DEBUG: Inferred slide dimensions {slide_w}x{slide_h}")
@@ -4377,12 +4352,6 @@ class MainWindow(QMainWindow):
             labels = cluster_features(features, k)
             colours = generate_palette(int(labels.max()) + 1)
             print(f"DEBUG: Generated {len(colours)} cluster colours")
-
-            # Clear custom cluster names on new data load
-            self.cluster_legend.clear_cluster_names()
-
-            # Update cluster legend
-            self.cluster_legend.update_clusters(labels, colours)
 
             # Compute and store centroids
             self._cluster_centroids = self._compute_centroids(features, labels)
@@ -4439,6 +4408,7 @@ class MainWindow(QMainWindow):
                     )
             # Hide progress bar when done
             self.progress_bar.setVisible(False)
+            self._sync_app_state()
         else:
             # Only recompute clusters using existing features
             if not hasattr(self, '_current_features'):
@@ -4449,12 +4419,6 @@ class MainWindow(QMainWindow):
             labels = cluster_features(features, k)
             colours = generate_palette(int(labels.max()) + 1)
             print(f"DEBUG: Generated {len(colours)} cluster colours for reclustering")
-
-            # Clear custom cluster names (cluster IDs change meaning on recluster)
-            self.cluster_legend.clear_cluster_names()
-
-            # Update cluster legend
-            self.cluster_legend.update_clusters(labels, colours)
 
             # Compute and store centroids
             self._cluster_centroids = self._compute_centroids(features, labels)
@@ -4474,7 +4438,8 @@ class MainWindow(QMainWindow):
                     self.atlas_thumbnail_panel.highlight_cluster(
                         next(iter(_prev_selected)), _prev_selected
                     )
-    
+            self._sync_app_state()
+
     def _compute_centroids(self, features: np.ndarray, labels: np.ndarray) -> np.ndarray:
         """Compute centroid of each cluster in feature space.
         
@@ -4504,7 +4469,63 @@ class MainWindow(QMainWindow):
         # Store max distances for normalization
         self._max_cluster_distances = max_distances
         return centroids
-    
+
+    def _sync_app_state(self) -> None:
+        """Push current GUI state into the app_state registry for MCP tools."""
+        pca_ratio = None
+        if hasattr(self, "_current_pca") and self._current_pca is not None:
+            pca_ratio = self._current_pca.explained_variance_ratio_.tolist()
+
+        region_data = {
+            rid: LabeledRegionData(
+                region_id=r.region_id,
+                name=r.name,
+                color_hex=r.color.name(),
+                patch_indices=list(r.patch_indices),
+                source_mode=r.source_mode.name.lower(),
+                kmeans_cluster=r.kmeans_cluster,
+            )
+            for rid, r in self._labeled_regions.items()
+        }
+
+        app_state.update(
+            slide_name=self.slide_combo.currentText() or None,
+            root_dir=self._root_dir,
+            selected_models=self._model_selection.models if self._model_selection else None,
+            magnification=self._model_selection.magnification if self._model_selection else None,
+            patch_size=self._model_selection.patch_size if self._model_selection else None,
+            features=getattr(self, "_current_features", None),
+            coords_lv0=getattr(self, "_current_coords_lv0", None),
+            coords_thumb=getattr(self, "_current_coords_thumb", None),
+            patch_size_lv0=getattr(self, "_current_patch_size_lv0", None),
+            cluster_labels=getattr(self, "_current_labels", None),
+            cluster_centroids=getattr(self, "_cluster_centroids", None),
+            cluster_colours=getattr(self, "_current_colours", None),
+            embedding_2d=getattr(self, "_current_embedding", None),
+            pca_explained_variance_ratio=pca_ratio,
+            labeled_regions=region_data,
+            selected_clusters=set(self._selected_clusters),
+            mpp=getattr(self, "_current_mpp", None),
+        )
+
+    def _sync_app_state_regions(self) -> None:
+        """Push only annotation state into the app_state registry."""
+        region_data = {
+            rid: LabeledRegionData(
+                region_id=r.region_id,
+                name=r.name,
+                color_hex=r.color.name(),
+                patch_indices=list(r.patch_indices),
+                source_mode=r.source_mode.name.lower(),
+                kmeans_cluster=r.kmeans_cluster,
+            )
+            for rid, r in self._labeled_regions.items()
+        }
+        app_state.update(
+            labeled_regions=region_data,
+            selected_clusters=set(self._selected_clusters),
+        )
+
     def _get_distance_to_centroid(self, index: int) -> Optional[float]:
         """Get normalized distance from a patch to its cluster centroid.
         
@@ -4727,6 +4748,189 @@ class MainWindow(QMainWindow):
                 self.model_selector.setModelToolTip(model_name, "")
     
     # --- preferences and about dialogs ---
+    def _read_env_value(self, env_path: str, key: str) -> str:
+        """Read a key from a simple .env file."""
+        if not env_path:
+            return ""
+        try:
+            with open(env_path, "r", encoding="utf-8") as handle:
+                for line in handle:
+                    stripped = line.strip()
+                    if not stripped or stripped.startswith("#") or "=" not in stripped:
+                        continue
+                    name, value = stripped.split("=", 1)
+                    if name.strip() == key:
+                        return value.strip().strip("\"").strip("'")
+        except Exception:
+            return ""
+        return ""
+
+    def _build_chat_config(self) -> Optional[ChatAgentConfig]:
+        """Build chat agent config from persisted settings."""
+        chat_enabled = self.settings.value("chat_enabled", True, type=bool)
+        if not chat_enabled:
+            return None
+
+        default_secrets_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+        secrets_path = self.settings.value("chat_secrets_path", default_secrets_path, type=str).strip()
+        if not secrets_path:
+            secrets_path = default_secrets_path
+        if not os.path.exists(secrets_path):
+            raise FileNotFoundError(
+                f"Secrets file not found: {secrets_path}. Create .env with OPENAI_API_KEY."
+            )
+        api_key = self._read_env_value(secrets_path, "OPENAI_API_KEY")
+        if not api_key:
+            raise ValueError(
+                f"OPENAI_API_KEY not found in secrets file: {secrets_path}"
+            )
+
+        model = self.settings.value("chat_model", "gpt-5-nano", type=str)
+        llm_timeout = float(self.settings.value("chat_llm_timeout_s", 60, type=int))
+        tool_timeout = float(self.settings.value("chat_tool_timeout_s", 30, type=int))
+
+        return ChatAgentConfig(
+            model=model,
+            api_key=api_key,
+            llm_timeout_s=llm_timeout,
+            tool_timeout_s=tool_timeout,
+        )
+
+    def _teardown_chat_agent(self) -> None:
+        """Stop chat worker thread and release resources."""
+        if self._chat_worker is not None:
+            try:
+                self.chat_shutdown_requested.emit()
+            except Exception:
+                pass
+            try:
+                self.chat_submit_requested.disconnect(self._chat_worker.submit_user_message)
+                self.chat_cancel_requested.disconnect(self._chat_worker.cancel_current)
+                self.chat_shutdown_requested.disconnect(self._chat_worker.shutdown)
+            except Exception:
+                pass
+            self._chat_worker.deleteLater()
+        if self._chat_thread is not None:
+            self._chat_thread.quit()
+            self._chat_thread.wait(1000)
+            self._chat_thread.deleteLater()
+        self._chat_worker = None
+        self._chat_thread = None
+
+    def _setup_chat_agent(self) -> None:
+        """Initialize chat worker in dedicated thread using current settings."""
+        self._teardown_chat_agent()
+        try:
+            config = self._build_chat_config()
+        except Exception as exc:
+            if hasattr(self, "chat_dock"):
+                self.chat_dock.set_status_text(str(exc))
+                self.chat_dock.set_busy(False)
+            return
+        if config is None:
+            if hasattr(self, "chat_dock"):
+                self.chat_dock.set_status_text("Configure API key in Preferences to enable chat.")
+                self.chat_dock.set_busy(False)
+            return
+
+        self._chat_thread = QThread()
+        self._chat_worker = ChatAgentWorker(config)
+        self._chat_worker.moveToThread(self._chat_thread)
+
+        self.chat_submit_requested.connect(self._chat_worker.submit_user_message)
+        self.chat_cancel_requested.connect(self._chat_worker.cancel_current)
+        self.chat_shutdown_requested.connect(self._chat_worker.shutdown)
+
+        self._chat_worker.response_started.connect(self._on_chat_response_started)
+        self._chat_worker.response_delta.connect(self._on_chat_response_delta)
+        self._chat_worker.tool_finished.connect(self._on_chat_tool_finished)
+        self._chat_worker.response_finished.connect(self._on_chat_response_finished)
+        self._chat_worker.error_emitted.connect(self._on_chat_error_emitted)
+        self._chat_worker.state_changed.connect(self._on_chat_state_changed)
+
+        self._chat_thread.start()
+        if hasattr(self, "chat_dock"):
+            self.chat_dock.set_status_text("Ready")
+            self.chat_dock.set_busy(False)
+
+    def _on_chat_send_requested(self, text: str) -> None:
+        """Forward user chat message to worker with bounded app context."""
+        if self._chat_worker is None:
+            self.chat_dock.add_error(
+                "Chat is not configured",
+                "Set a valid .env path with OPENAI_API_KEY in Preferences.",
+            )
+            return
+        self.chat_dock.add_user_message(text)
+        context = {"root_dir": self._root_dir}
+        self.chat_submit_requested.emit(text, context)
+
+    def _on_chat_cancel_requested(self) -> None:
+        """Cancel current chat run."""
+        self.chat_cancel_requested.emit()
+
+    def _on_chat_response_started(self, _message_id: str) -> None:
+        """Mark beginning of assistant response lifecycle."""
+        return None
+
+    def _on_chat_response_delta(self, _message_id: str, text_delta: str) -> None:
+        """Render streaming response chunk."""
+        self.chat_dock.stop_typing_indicator()
+        self.chat_dock.append_assistant_delta(text_delta)
+
+    def _on_chat_tool_finished(
+        self,
+        _call_id: str,
+        tool_name: str,
+        summary: Dict[str, object],
+        raw: Dict[str, object],
+    ) -> None:
+        """Render a completed tool result card."""
+        self.chat_dock.add_tool_card(tool_name, summary, raw)
+
+    def _on_chat_response_finished(
+        self,
+        _message_id: str,
+        _full_text: str,
+        usage: Dict[str, object],
+        latency_ms: int,
+    ) -> None:
+        """Finalize assistant response UI state and status line."""
+        self.chat_dock.stop_typing_indicator()
+        self.chat_dock.finish_assistant_message()
+        total_tokens = usage.get("total_tokens")
+        if total_tokens is None:
+            self.chat_dock.set_status_text(f"Done in {latency_ms} ms")
+        else:
+            self.chat_dock.set_status_text(
+                f"Done in {latency_ms} ms | tokens: {total_tokens}"
+            )
+
+    def _on_chat_error_emitted(
+        self,
+        _message_id: str,
+        _error_code: str,
+        user_message: str,
+        details: str,
+    ) -> None:
+        """Render worker errors in chat view."""
+        self.chat_dock.stop_typing_indicator()
+        self.chat_dock.add_error(user_message, details)
+        self.chat_dock.finish_assistant_message()
+
+    def _on_chat_state_changed(self, state: str) -> None:
+        """Toggle chat controls for worker state."""
+        busy = state in {"running", "cancelling"}
+        self.chat_dock.set_busy(busy)
+        if state == "running":
+            self.chat_dock.start_typing_indicator()
+            self.chat_dock.set_status_text("Running...")
+        elif state == "cancelling":
+            self.chat_dock.stop_typing_indicator()
+            self.chat_dock.set_status_text("Cancelling...")
+        elif state == "idle":
+            self.chat_dock.stop_typing_indicator()
+
     def _show_preferences(self) -> None:
         """Display preferences dialog."""
         from preferences_dialog import PreferencesDialog
@@ -4734,6 +4938,7 @@ class MainWindow(QMainWindow):
         if dialog.exec():
             # Reload preferences after dialog closes
             self.normalize_features = self.settings.value("normalize_features", True, type=bool)
+            self._setup_chat_agent()
     
     def _show_about(self) -> None:
         """Display About dialog with version and attribution."""
@@ -4821,6 +5026,7 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event) -> None:
         """Handle application close event and clean up resources."""
         print("DEBUG: Application closing, cleaning up resources")
+        self._teardown_chat_agent()
         # Clean up tile manager in graphics view
         if hasattr(self, 'graphics_view'):
             self.graphics_view.cleanup()
@@ -4895,19 +5101,13 @@ class MainWindow(QMainWindow):
 
     def _on_sidebar_tab_changed(self, index: int) -> None:
         """Handle sidebar tab change to switch selection modes."""
-        if index == 0:  # K-means tab — always use local groups
-            self._set_selection_mode(SelectionMode.KMEANS)
+        if index == 0:  # Local Region tab — mode driven by Full Slide checkbox
             self._restore_local_to_views()
-            self._apply_all_labeled_region_styles()   # re-paint after restore resets opacities
-        elif index == 1:  # Local Region tab
-            self._set_selection_mode(SelectionMode.LOCAL_REGION)
+            self._apply_all_labeled_region_styles()
+        else:  # Atlas tab (index 1) and any future tabs
             if self._is_atlas_active():
                 self._apply_atlas_to_views()
-        else:  # Atlas tab (index 2) and any future tabs
-            if self._is_atlas_active():
-                self._apply_atlas_to_views()
-        # In Local/Atlas tabs, paint any KMEANS-mode labeled regions on top
-        # (In K-means tab, _apply_selected_cluster_styles_to_slide handles this)
+        # Paint any KMEANS-mode labeled regions on top when on Atlas tab
         if index != 0 and self._labeled_regions and self.graphics_view.rect_items:
             for _region in self._labeled_regions.values():
                 if _region.source_mode == SourceMode.KMEANS:
@@ -4916,6 +5116,15 @@ class MainWindow(QMainWindow):
                             _rect = self.graphics_view.rect_items[_idx]
                             _rect.setBrush(QBrush(_region.color))
                             _rect.setOpacity(0.6)
+
+    def _on_full_slide_toggled(self, checked: bool) -> None:
+        """Handle Full Slide checkbox toggle — switches between KMEANS and LOCAL_REGION mode."""
+        if checked:
+            self._set_selection_mode(SelectionMode.KMEANS)
+            self._restore_local_to_views()
+            self._apply_all_labeled_region_styles()
+        else:
+            self._set_selection_mode(SelectionMode.LOCAL_REGION)
 
     def _set_selection_mode(self, mode: SelectionMode) -> None:
         """Switch between K-means and Local Region selection modes."""
@@ -5272,6 +5481,7 @@ class MainWindow(QMainWindow):
                     del self._labeled_regions[region_id]
                 self.local_region_widget.remove_region(region_id)
                 self.labeled_regions_widget.remove_region(region_id)
+            self._sync_app_state_regions()
 
             return
 
@@ -5307,6 +5517,7 @@ class MainWindow(QMainWindow):
         )
         self.labeled_regions_widget.add_region(region)
         self._update_labeled_export_action()
+        self._sync_app_state_regions()
 
         print(f"DEBUG: Created local region cluster {cluster_id} with {len(patch_indices)} patches")
 
@@ -5450,6 +5661,7 @@ class MainWindow(QMainWindow):
             self.labeled_regions_widget.remove_region(region_id)
             self._apply_local_region_cluster_styles()
             self._update_labeled_export_action()
+            self._sync_app_state_regions()
             print(f"DEBUG: Deleted local region cluster {region_id}")
 
     def _on_labeled_region_deleted_from_panel(self, region_id: int) -> None:
@@ -5467,10 +5679,10 @@ class MainWindow(QMainWindow):
             self.local_region_widget.remove_region(region_id)
         elif region.source_mode == SourceMode.KMEANS:
             self._selected_clusters.discard(region.kmeans_cluster)
-            self._sync_legend_checkboxes()
         self.labeled_regions_widget.remove_region(region_id)
         self._apply_all_labeled_region_styles()
         self._update_labeled_export_action()
+        self._sync_app_state_regions()
         print(f"DEBUG: Deleted labeled region {region_id} from panel")
 
     def _clear_local_region_clusters(self) -> None:
@@ -5483,6 +5695,7 @@ class MainWindow(QMainWindow):
         self.local_region_widget.clear_regions()
         self._apply_local_region_cluster_styles()
         self._update_labeled_export_action()
+        self._sync_app_state_regions()
         print("DEBUG: Cleared all local region clusters")
 
     def _clear_all_labeled_regions(self) -> None:
@@ -5492,9 +5705,9 @@ class MainWindow(QMainWindow):
         self._selected_clusters.clear()
         self.labeled_regions_widget.clear_regions()
         self.local_region_widget.clear_regions()
-        self._sync_legend_checkboxes()
         self._apply_all_labeled_region_styles()
         self._update_labeled_export_action()
+        self._sync_app_state_regions()
         print("DEBUG: Cleared all labeled regions")
 
     # -------------------------------------------------------------------------
@@ -5571,7 +5784,7 @@ class MainWindow(QMainWindow):
         self._next_region_id += 1
         region = LabeledRegion(
             region_id=region_id,
-            name=self.cluster_legend.get_cluster_name(cluster),
+            name=f"Cluster {cluster}",
             color=color,
             patch_indices=indices,
             source_mode=SourceMode.KMEANS,
@@ -5582,8 +5795,8 @@ class MainWindow(QMainWindow):
         self._last_labeled_slide = region.slide_name
         self._selected_clusters.add(cluster)
         self.labeled_regions_widget.add_region(region)
-        self._sync_legend_checkboxes()
         self._update_labeled_export_action()
+        self._sync_app_state_regions()
         print(f"DEBUG: Created K-means labeled region {region_id} for cluster {cluster}")
         return True
 
@@ -5594,9 +5807,9 @@ class MainWindow(QMainWindow):
                 del self._labeled_regions[region_id]
                 self._selected_clusters.discard(cluster)
                 self.labeled_regions_widget.remove_region(region_id)
-                self._sync_legend_checkboxes()
                 self._update_labeled_export_action()
                 self._apply_all_labeled_region_styles()
+                self._sync_app_state_regions()
                 print(f"DEBUG: Deleted K-means labeled region {region_id} for cluster {cluster}")
                 break
 
@@ -5945,6 +6158,21 @@ class MainWindow(QMainWindow):
 
             # Build the atlas
             self._cluster_atlas = builder.build(progress_callback=update_progress)
+
+            # Populate Qt-free atlas state for MCP tools
+            try:
+                from app_state import AtlasState  # type: ignore
+                import app_state as _app_state
+                _app_state.update(
+                    atlas_state=AtlasState(
+                        global_labels=self._cluster_atlas.global_labels.copy(),
+                        slide_indices=self._cluster_atlas.slide_indices.copy(),
+                        slide_names=list(self._cluster_atlas.slide_names),
+                        n_clusters=self._cluster_atlas.n_clusters,
+                    )
+                )
+            except Exception:
+                pass
 
             self.atlas_progress.setValue(95)
             QApplication.processEvents()
