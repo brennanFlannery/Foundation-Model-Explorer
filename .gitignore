@@ -46,3 +46,8 @@ Plans/
 
 # Exported annotation files
 *.geojson
+
+# API keys and env (secrets)
+api_key.txt
+.env
+.env.*
