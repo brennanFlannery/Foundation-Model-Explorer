@@ -111,6 +111,30 @@ TOOL_HINTS: Dict[str, str] = {
     "atlas_cluster_representation": "cross-slide atlas distribution by cluster",
     "rank_models_by_selected_cluster_separability": "rank models for selected clusters",
     "rank_models_by_labeled_region_separability": "rank models for chosen labeled regions",
+    # GUI action tools
+    "find_most_similar_cluster": "find cluster most similar to a region by centroid distance",
+    "label_cluster": "label an entire K-means cluster as a new region",
+    "label_similar_cluster": "find + label the cluster most similar to a region",
+    "label_similar_patches_as_region": "find similar patches and create a region from them",
+    "create_region_from_patches": "create a labeled region from explicit patch indices",
+    "delete_region": "remove a labeled region from the GUI",
+    "rename_region": "rename a labeled region",
+    "navigate_to_region": "pan and zoom slide view to show a region",
+    "select_cluster": "highlight a K-means cluster in slide and scatter views",
+    "clear_all_regions": "remove all labeled regions",
+    "deselect_all_clusters": "clear cluster selection highlighting",
+    "expand_region": "expand a labeled region outward by N grid rings of adjacent patches",
+    "find_most_different_cluster": "find cluster most dissimilar to combined centroid of one or more regions",
+    "switch_to_atlas_view": "switch GUI sidebar to the Atlas tab",
+    "highlight_atlas_cluster": "highlight a cluster across all atlas thumbnails and scatter view",
+    "set_cluster_count": "change K-means cluster count and re-cluster",
+    "load_slide": "switch the active slide in the GUI",
+    "lookup_patch_by_coords": "find patch nearest to a given level-0 coordinate",
+    "export_regions_geojson": "export all labeled regions to a GeoJSON file",
+    "open_patch_exemplar_popup": "open a horizontal popup with sampled exemplar patch images",
+    "export_current_exemplar_popup": "export images currently shown in exemplar popup",
+    "close_exemplar_popup": "close the active exemplar popup",
+    "generate_slide_qc_report": "create a markdown QC report plus JSON summary for a slide/model setup",
 }
 
 
@@ -163,6 +187,30 @@ class ChatAgentWorker(QObject):
             "atlas_cluster_representation",
             "rank_models_by_selected_cluster_separability",
             "rank_models_by_labeled_region_separability",
+            # GUI action tools
+            "find_most_similar_cluster",
+            "label_cluster",
+            "label_similar_cluster",
+            "label_similar_patches_as_region",
+            "create_region_from_patches",
+            "delete_region",
+            "rename_region",
+            "navigate_to_region",
+            "select_cluster",
+            "clear_all_regions",
+            "deselect_all_clusters",
+            "expand_region",
+            "find_most_different_cluster",
+            "switch_to_atlas_view",
+            "highlight_atlas_cluster",
+            "set_cluster_count",
+            "load_slide",
+            "lookup_patch_by_coords",
+            "export_regions_geojson",
+            "open_patch_exemplar_popup",
+            "export_current_exemplar_popup",
+            "close_exemplar_popup",
+            "generate_slide_qc_report",
         }
         self._cached_tools: Optional[List[Dict[str, Any]]] = None
         self._tool_stats: Dict[str, Dict[str, float]] = {}
@@ -500,6 +548,8 @@ class ChatAgentWorker(QObject):
             "compare_models",
             "rank_models_by_separability",
             "compute_elbow_analysis",
+            "generate_slide_qc_report",
+            "load_slide",
         }
 
         if has_slide_loaded:
@@ -516,15 +566,46 @@ class ChatAgentWorker(QObject):
                     "get_boundary_patches",
                     "get_pca_info",
                     "compare_selected_clusters",
+                    # GUI action tools — available whenever a slide is loaded
+                    "label_cluster",
+                    "select_cluster",
+                    "clear_all_regions",
+                    "deselect_all_clusters",
+                    "create_region_from_patches",
+                    "navigate_to_region",
+                    "set_cluster_count",
+                    "lookup_patch_by_coords",
+                    "open_patch_exemplar_popup",
+                    "close_exemplar_popup",
                 }
             )
 
         if has_labeled_regions:
-            selected.add("rank_models_by_labeled_region_separability")
+            selected.update(
+                {
+                    "rank_models_by_labeled_region_separability",
+                    # GUI action tools — require at least one region to exist
+                    "find_most_similar_cluster",
+                    "label_similar_cluster",
+                    "label_similar_patches_as_region",
+                    "delete_region",
+                    "rename_region",
+                    "expand_region",
+                    "find_most_different_cluster",
+                    "export_regions_geojson",
+                    "export_current_exemplar_popup",
+                }
+            )
         if has_selected_clusters:
             selected.add("rank_models_by_selected_cluster_separability")
         if atlas_ready:
-            selected.add("atlas_cluster_representation")
+            selected.update(
+                {
+                    "atlas_cluster_representation",
+                    "switch_to_atlas_view",
+                    "highlight_atlas_cluster",
+                }
+            )
 
         return {name for name in selected if name in self._allowed_tools}
 
@@ -601,14 +682,31 @@ class ChatAgentWorker(QObject):
     def _slash_help_text() -> str:
         return (
             "Slash commands:\n"
-            "/data {json} -> list_data\n"
-            "/slide {json} -> describe_slide\n"
-            "/models {json} -> rank_models_by_separability\n"
-            "/regions {json} -> list_labeled_regions\n"
-            "/clusters {json} -> compare_selected_clusters\n"
-            "/atlas {json} -> atlas_cluster_representation\n"
+            "\n"
+            "— Inspection —\n"
+            "/data {json}     -> list_data\n"
+            "/slide {json}    -> describe_slide\n"
+            "/models {json}   -> rank_models_by_separability\n"
+            "/regions         -> list_labeled_regions\n"
+            "/clusters        -> compare_selected_clusters\n"
+            "/atlas           -> atlas_cluster_representation\n"
+            "\n"
+            "— GUI actions —\n"
+            "/label {\"cluster_id\": N}                        -> label_cluster\n"
+            "/select {\"cluster_id\": N}                       -> select_cluster\n"
+            "/similar {\"region_id\": N}                       -> label_similar_cluster\n"
+            "/navigate {\"region_id\": N}                      -> navigate_to_region\n"
+            "/rename {\"region_id\": N, \"new_name\": \"...\"}    -> rename_region\n"
+            "/delete {\"region_id\": N}                        -> delete_region\n"
+            "/clear                                          -> clear_all_regions\n"
+            "/deselect                                       -> deselect_all_clusters\n"
+            "/expand {\"region_id\": N, \"n_rings\": 1}          -> expand_region\n"
+            "/different {\"region_ids\": [N]}                   -> find_most_different_cluster\n"
+            "/atlas-cluster {\"cluster_id\": N}                 -> highlight_atlas_cluster\n"
+            "\n"
+            "— Escape hatch —\n"
             "/tool <name> {json} -> direct MCP tool call\n"
-            "/tools -> show this help"
+            "/tools              -> show this help"
         )
 
     def _stream_final_response(
@@ -816,7 +914,7 @@ class ChatAgentWorker(QObject):
         # get_boundary_patches
         if "boundary_patches" in raw:
             patches = raw.get("boundary_patches") or []
-            return {
+            result = {
                 "top_k": raw.get("top_k"),
                 "top_5_shown": [
                     {
@@ -829,6 +927,9 @@ class ChatAgentWorker(QObject):
                 ],
                 "note": raw.get("note"),
             }
+            if "cluster_pair" in raw:
+                result["cluster_pair"] = raw["cluster_pair"]
+            return result
 
         # get_pca_info
         if "pca_explained_variance_ratio" in raw:

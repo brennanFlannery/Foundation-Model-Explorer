@@ -32,16 +32,43 @@ clusters (useful for testing in constrained environments).
 
 from __future__ import annotations
 
-from typing import Iterable, List, Sequence, Tuple
+from dataclasses import dataclass, field
+from math import ceil
+from typing import Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
 
 try:
     from sklearn.cluster import KMeans  # type: ignore
+    from sklearn.decomposition import PCA  # type: ignore
     _SKLEARN_AVAILABLE = True
 except Exception:
     # If sklearn isn't installed, we'll fall back to random labels.
     _SKLEARN_AVAILABLE = False
+
+
+@dataclass
+class RegionInfo:
+    """Represents a spatial subcluster (macro-region) within a K-means cluster.
+
+    Attributes
+    ----------
+    region_index : int
+        Globally unique index (row in the region embedding array).
+    kmeans_cluster : int
+        Parent K-means cluster id.
+    patch_indices : List[int]
+        Indices into the original features/coords arrays.
+    centroid_coord : np.ndarray
+        Mean thumbnail coordinate (shape: 2,).
+    color_hsl : str
+        Inherited HSL colour string from the parent cluster palette.
+    """
+    region_index: int
+    kmeans_cluster: int
+    patch_indices: List[int]
+    centroid_coord: "np.ndarray"
+    color_hsl: str
 
 
 def generate_palette(n: int) -> List[str]:
@@ -214,3 +241,119 @@ def radial_sweep_order(coords: np.ndarray, click_point: Tuple[float, float]) -> 
     dists = np.linalg.norm(coords - click, axis=1)
     order = np.argsort(dists)
     return order.astype(int)
+
+
+def compute_spatial_subclusters(
+    features: np.ndarray,
+    coords: np.ndarray,
+    labels: np.ndarray,
+    colours: List[str],
+    patches_per_region: int = 15,
+) -> List[RegionInfo]:
+    """Spatially sub-cluster each K-means cluster into groups of ~M patches.
+
+    Within each K-means cluster, patches are further grouped by spatial
+    proximity into N = ceil(cluster_size / patches_per_region) subgroups.
+    Each subgroup becomes a RegionInfo with its own identity.
+
+    Parameters
+    ----------
+    features : np.ndarray
+        Feature array of shape (n_patches, feature_dim).
+    coords : np.ndarray
+        Thumbnail coordinates array of shape (n_patches, 2) or (n_patches, 3).
+    labels : np.ndarray
+        K-means cluster labels of shape (n_patches,).
+    colours : List[str]
+        HSL colour strings, one per K-means cluster.
+    patches_per_region : int
+        Target number of patches per subgroup (M).
+
+    Returns
+    -------
+    List[RegionInfo]
+        One RegionInfo per subgroup, ordered by (cluster, sub-label).
+    """
+    regions: List[RegionInfo] = []
+    region_index = 0
+    n_clusters = len(colours)
+    rng = np.random.default_rng(seed=42)
+
+    for cluster_id in range(n_clusters):
+        cluster_mask = labels == cluster_id
+        cluster_indices = np.where(cluster_mask)[0]
+        n_c = len(cluster_indices)
+        if n_c == 0:
+            continue
+
+        color_hsl = colours[cluster_id] if cluster_id < len(colours) else "hsl(0,70%,50%)"
+        N = max(1, ceil(n_c / patches_per_region))
+        N = min(N, n_c)  # cannot have more subclusters than patches
+
+        # Spatial coordinates for sub-clustering (use only x,y columns)
+        spatial = coords[cluster_indices, :2].astype(float)
+
+        if N == 1 or n_c == 1:
+            sub_labels = np.zeros(n_c, dtype=int)
+        elif _SKLEARN_AVAILABLE:
+            km = KMeans(n_clusters=N, random_state=42, n_init=5)
+            sub_labels = km.fit_predict(spatial)
+        else:
+            sub_labels = rng.integers(0, N, size=n_c)
+
+        for sub_id in range(N):
+            sub_mask = sub_labels == sub_id
+            if not sub_mask.any():
+                continue
+            local_indices = cluster_indices[sub_mask]
+            centroid = coords[local_indices, :2].mean(axis=0)
+            regions.append(RegionInfo(
+                region_index=region_index,
+                kmeans_cluster=cluster_id,
+                patch_indices=local_indices.tolist(),
+                centroid_coord=centroid,
+                color_hsl=color_hsl,
+            ))
+            region_index += 1
+
+    return regions
+
+
+def compute_region_pca_embedding(
+    regions: List[RegionInfo],
+    features: np.ndarray,
+) -> Tuple[Optional[np.ndarray], object]:
+    """Compute a 2D PCA embedding of mean features per region.
+
+    Parameters
+    ----------
+    regions : List[RegionInfo]
+        List of RegionInfo objects (from compute_spatial_subclusters).
+    features : np.ndarray
+        Feature array of shape (n_patches, feature_dim).
+
+    Returns
+    -------
+    Tuple[Optional[np.ndarray], object]
+        (coords_2d, pca_model) where coords_2d has shape (n_regions, 2).
+        Returns (None, None) if embedding cannot be computed.
+    """
+    if not _SKLEARN_AVAILABLE or len(regions) < 2:
+        return (None, None)
+
+    mean_features = np.stack([
+        features[r.patch_indices].mean(axis=0) for r in regions
+    ])
+
+    if mean_features.ndim < 2 or mean_features.shape[1] < 2:
+        return (None, None)
+
+    n_components = min(2, mean_features.shape[0], mean_features.shape[1])
+    pca = PCA(n_components=n_components)
+    coords_2d = pca.fit_transform(mean_features)
+
+    if coords_2d.shape[1] == 1:
+        # Pad with zeros column to get shape (N, 2)
+        coords_2d = np.column_stack([coords_2d, np.zeros(len(coords_2d))])
+
+    return (coords_2d, pca)

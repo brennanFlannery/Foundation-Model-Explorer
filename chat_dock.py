@@ -263,6 +263,17 @@ class ChatDockWidget(QDockWidget):
             {"command": "regions", "display": "/regions", "description": "List labeled regions"},
             {"command": "clusters", "display": "/clusters", "description": "Compare selected clusters"},
             {"command": "atlas", "display": "/atlas", "description": "Atlas cluster representation"},
+            {"command": "label", "display": "/label", "description": "Label a K-means cluster: /label {\"cluster_id\": 2}"},
+            {"command": "select", "display": "/select", "description": "Highlight a cluster: /select {\"cluster_id\": 2}"},
+            {"command": "navigate", "display": "/navigate", "description": "Pan/zoom to a region: /navigate {\"region_id\": 0}"},
+            {"command": "delete", "display": "/delete", "description": "Delete a region: /delete {\"region_id\": 0}"},
+            {"command": "rename", "display": "/rename", "description": "Rename a region: /rename {\"region_id\": 0, \"new_name\": \"Tumor\"}"},
+            {"command": "clear", "display": "/clear", "description": "Remove all labeled regions"},
+            {"command": "deselect", "display": "/deselect", "description": "Clear cluster selection highlighting"},
+            {"command": "similar", "display": "/similar", "description": "Label cluster most similar to a region: /similar {\"region_id\": 0}"},
+            {"command": "expand", "display": "/expand", "description": "Expand a region by N grid rings: /expand {\"region_id\": 0, \"n_rings\": 1}"},
+            {"command": "different", "display": "/different", "description": "Find most different cluster: /different {\"region_ids\": [0]}"},
+            {"command": "atlas-cluster", "display": "/atlas-cluster", "description": "Highlight atlas cluster: /atlas-cluster {\"cluster_id\": 3}"},
             {"command": "tool", "display": "/tool", "description": "Direct tool call: /tool <name> {json}"},
             {"command": "tools", "display": "/tools", "description": "Show slash command help"},
         ]
@@ -302,6 +313,31 @@ class ChatDockWidget(QDockWidget):
         self._slash_list.setVerticalScrollMode(QListWidget.ScrollMode.ScrollPerPixel)
         self._slash_list.itemClicked.connect(self._on_slash_item_clicked)
         popup_layout.addWidget(self._slash_list)
+
+        # @ mention popup — mutually exclusive with slash popup
+        self._at_catalog: List[Dict[str, Any]] = []  # [{name: str, region_id: int}, ...]
+        self._at_popup = QFrame(container)
+        self._at_popup.setVisible(False)
+        self._at_popup.setObjectName("at-mention-popup")
+        self._at_popup.setStyleSheet(
+            "QFrame#at-mention-popup {"
+            "background: #ffffff; border: 1px solid #cbd5e1; border-radius: 8px; }"
+            "QListWidget { border: none; background: transparent; color: #0f172a; outline: none; }"
+            "QListWidget::item { padding: 6px 8px; color: #0f172a; background: transparent; }"
+            "QListWidget::item:selected { background: #d1fae5; color: #0f172a; }"
+        )
+        at_popup_layout = QVBoxLayout(self._at_popup)
+        at_popup_layout.setContentsMargins(2, 2, 2, 2)
+        at_popup_layout.setSpacing(0)
+        self._at_list = QListWidget(self._at_popup)
+        self._at_list.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self._at_list.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self._at_list.setWordWrap(False)
+        self._at_list.setUniformItemSizes(True)
+        self._at_list.setVerticalScrollMode(QListWidget.ScrollMode.ScrollPerPixel)
+        self._at_list.itemClicked.connect(self._on_at_item_clicked)
+        at_popup_layout.addWidget(self._at_list)
+
         self.input_box.textChanged.connect(self._on_input_text_changed)
 
     def _on_send(self) -> None:
@@ -309,9 +345,16 @@ class ChatDockWidget(QDockWidget):
         if not text:
             return
         self._hide_slash_popup()
+        self._hide_at_popup()
         self.input_box.clear()
         slash_command, parse_error = self._parse_slash_command(text)
-        metadata = {"slash_command": slash_command, "slash_parse_error": parse_error}
+        at_regions, at_unresolved = self._resolve_at_mentions(text, self._at_catalog)
+        metadata = {
+            "slash_command": slash_command,
+            "slash_parse_error": parse_error,
+            "at_regions": at_regions,
+            "at_unresolved": at_unresolved,
+        }
         self.send_requested.emit(text, metadata)
 
     @staticmethod
@@ -338,6 +381,17 @@ class ChatDockWidget(QDockWidget):
             "regions": "list_labeled_regions",
             "clusters": "compare_selected_clusters",
             "atlas": "atlas_cluster_representation",
+            "label": "label_cluster",
+            "select": "select_cluster",
+            "navigate": "navigate_to_region",
+            "delete": "delete_region",
+            "rename": "rename_region",
+            "clear": "clear_all_regions",
+            "deselect": "deselect_all_clusters",
+            "similar": "label_similar_cluster",
+            "expand": "expand_region",
+            "different": "find_most_different_cluster",
+            "atlas-cluster": "highlight_atlas_cluster",
         }
 
         if command == "tool":
@@ -424,32 +478,57 @@ class ChatDockWidget(QDockWidget):
         self._update_row_widths()
         if self._slash_popup.isVisible():
             self._position_slash_popup()
+        if self._at_popup.isVisible():
+            self._position_at_popup()
 
     def eventFilter(self, obj, event) -> bool:
         if obj is self.input_box:
             if event.type() == QEvent.Type.FocusOut:
                 self._hide_slash_popup()
-            if event.type() == QEvent.Type.KeyPress and self._slash_popup.isVisible():
-                key = event.key()
-                if key in (Qt.Key.Key_Down, Qt.Key.Key_Up):
-                    self._move_slash_selection(+1 if key == Qt.Key.Key_Down else -1)
-                    return True
-                if key in (Qt.Key.Key_Return, Qt.Key.Key_Enter, Qt.Key.Key_Tab):
-                    self._commit_slash_selection()
-                    return True
-                if key == Qt.Key.Key_Escape:
-                    self._hide_slash_popup()
-                    return True
+                self._hide_at_popup()
+            if event.type() == QEvent.Type.KeyPress:
+                if self._at_popup.isVisible():
+                    key = event.key()
+                    if key in (Qt.Key.Key_Down, Qt.Key.Key_Up):
+                        self._move_at_selection(+1 if key == Qt.Key.Key_Down else -1)
+                        return True
+                    if key in (Qt.Key.Key_Return, Qt.Key.Key_Enter, Qt.Key.Key_Tab):
+                        self._commit_at_selection()
+                        return True
+                    if key == Qt.Key.Key_Escape:
+                        self._hide_at_popup()
+                        return True
+                if self._slash_popup.isVisible():
+                    key = event.key()
+                    if key in (Qt.Key.Key_Down, Qt.Key.Key_Up):
+                        self._move_slash_selection(+1 if key == Qt.Key.Key_Down else -1)
+                        return True
+                    if key in (Qt.Key.Key_Return, Qt.Key.Key_Enter, Qt.Key.Key_Tab):
+                        self._commit_slash_selection()
+                        return True
+                    if key == Qt.Key.Key_Escape:
+                        self._hide_slash_popup()
+                        return True
         return super().eventFilter(obj, event)
 
     def _on_input_text_changed(self) -> None:
         text = self.input_box.toPlainText()
-        prefix = self._extract_slash_prefix(text)
-        if prefix is None:
-            self._hide_slash_popup()
+        # Slash takes priority
+        slash_prefix = self._extract_slash_prefix(text)
+        if slash_prefix is not None:
+            self._hide_at_popup()
+            matches = self._get_slash_matches(slash_prefix, self._slash_catalog)
+            self._update_slash_popup(matches)
             return
-        matches = self._get_slash_matches(prefix, self._slash_catalog)
-        self._update_slash_popup(matches)
+        self._hide_slash_popup()
+        # @ popup
+        cursor_pos = self.input_box.textCursor().position()
+        at_prefix = self._extract_at_prefix(text, cursor_pos)
+        if at_prefix is not None and self._at_catalog:
+            matches = self._get_at_matches(at_prefix, self._at_catalog)
+            self._update_at_popup(matches)
+        else:
+            self._hide_at_popup()
 
     def _update_slash_popup(self, matches: List[Dict[str, str]]) -> None:
         if not matches:
@@ -566,6 +645,163 @@ class ChatDockWidget(QDockWidget):
             entry for entry in catalog
             if entry.get("command", "").lower().startswith(prefix)
         ]
+
+    # ------------------------------------------------------------------
+    # @ mention support
+    # ------------------------------------------------------------------
+
+    def update_region_catalog(self, regions: List[Dict[str, Any]]) -> None:
+        """Update the @ mention catalog. regions = [{name, region_id}, ...]"""
+        self._at_catalog = regions
+        # Re-filter if popup is currently open
+        if self._at_popup.isVisible():
+            text = self.input_box.toPlainText()
+            cursor_pos = self.input_box.textCursor().position()
+            prefix = self._extract_at_prefix(text, cursor_pos)
+            if prefix is None:
+                self._hide_at_popup()
+            else:
+                self._update_at_popup(self._get_at_matches(prefix, self._at_catalog))
+
+    @staticmethod
+    def _extract_at_prefix(text: str, cursor_pos: int) -> Optional[str]:
+        """Return text after the last unambiguous @ before cursor, or None.
+
+        @ must be at start-of-text or preceded by whitespace (avoids emails).
+        """
+        segment = text[:cursor_pos]
+        at_idx = segment.rfind('@')
+        if at_idx < 0:
+            return None
+        # @ must be at start or preceded by whitespace
+        if at_idx > 0 and not segment[at_idx - 1].isspace():
+            return None
+        return segment[at_idx + 1:]  # "" means show all; "Reg" means filter
+
+    @staticmethod
+    def _get_at_matches(prefix: str, catalog: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        prefix_lower = prefix.lower()
+        return [e for e in catalog if e["name"].lower().startswith(prefix_lower)]
+
+    @staticmethod
+    def _resolve_at_mentions(
+        text: str, catalog: List[Dict[str, Any]]
+    ) -> Tuple[List[Dict[str, Any]], List[str]]:
+        """Scan text for @name tokens; resolve against catalog using longest-match.
+
+        Returns (resolved_list, unresolved_name_strings).
+        """
+        resolved: List[Dict[str, Any]] = []
+        unresolved: List[str] = []
+        seen_ids: set = set()
+        sorted_catalog = sorted(catalog, key=lambda e: len(e["name"]), reverse=True)
+        i = 0
+        while i < len(text):
+            if text[i] == '@' and (i == 0 or text[i - 1].isspace()):
+                after = text[i + 1:]
+                matched = None
+                for entry in sorted_catalog:
+                    name = entry["name"]
+                    if after.startswith(name):
+                        tail_pos = len(name)
+                        # Name must be followed by whitespace, @, newline, or end-of-string
+                        if tail_pos == len(after) or after[tail_pos] in (' ', '\t', '\n', '@'):
+                            matched = entry
+                            break
+                if matched:
+                    if matched["region_id"] not in seen_ids:
+                        resolved.append(matched)
+                        seen_ids.add(matched["region_id"])
+                    i += 1 + len(matched["name"])
+                    continue
+                else:
+                    # Collect unresolved token up to next whitespace
+                    end = i + 1
+                    while end < len(text) and not text[end].isspace():
+                        end += 1
+                    token = text[i + 1:end].strip()
+                    if token:
+                        unresolved.append(token)
+                    i = end
+                    continue
+            i += 1
+        return resolved, unresolved
+
+    def _update_at_popup(self, matches: List[Dict[str, Any]]) -> None:
+        if not matches:
+            self._hide_at_popup()
+            return
+        self._hide_slash_popup()  # mutually exclusive
+        self._at_list.clear()
+        for entry in matches:
+            item = QListWidgetItem(f"@{entry['name']}", self._at_list)
+            item.setData(Qt.ItemDataRole.UserRole, entry)
+            item.setSizeHint(QSize(item.sizeHint().width(), 28))
+        self._at_list.setCurrentRow(0)
+        self._position_at_popup()
+        self._at_popup.setVisible(True)
+        self._at_popup.raise_()
+
+    def _hide_at_popup(self) -> None:
+        self._at_popup.setVisible(False)
+        self._at_list.clear()
+
+    def _position_at_popup(self) -> None:
+        container = self.widget()
+        if container is None:
+            return
+        row_count = self._at_list.count()
+        visible_rows = min(6, max(1, row_count))
+        row_height = 28
+        preferred_height = visible_rows * row_height + 6
+        input_geom = self.input_box.geometry()
+        space_above = max(0, input_geom.y() - 4)
+        space_below = max(0, container.height() - (input_geom.bottom() + 4))
+        below_viable = space_below >= 80
+        if below_viable:
+            target_height = min(preferred_height, space_below)
+            y_pos = input_geom.bottom() + 4
+        else:
+            target_height = min(preferred_height, max(80, space_above))
+            y_pos = max(0, input_geom.y() - 4 - target_height)
+        self._at_popup.setGeometry(input_geom.x(), y_pos, input_geom.width(), target_height)
+
+    def _move_at_selection(self, delta: int) -> None:
+        count = self._at_list.count()
+        if count <= 0:
+            return
+        index = self._at_list.currentRow()
+        self._at_list.setCurrentRow((max(0, index) + delta) % count)
+
+    def _commit_at_selection(self) -> None:
+        item = self._at_list.currentItem()
+        if item is None:
+            return
+        entry = item.data(Qt.ItemDataRole.UserRole)
+        if not entry:
+            return
+        name = entry["name"]
+        text = self.input_box.toPlainText()
+        cursor_pos = self.input_box.textCursor().position()
+        segment = text[:cursor_pos]
+        at_idx = segment.rfind('@')
+        if at_idx < 0:
+            self._hide_at_popup()
+            return
+        insert_text = f"@{name} "
+        new_text = text[:at_idx] + insert_text + text[cursor_pos:]
+        new_cursor_pos = at_idx + len(insert_text)
+        self.input_box.blockSignals(True)
+        self.input_box.setPlainText(new_text)
+        self.input_box.blockSignals(False)
+        cursor = self.input_box.textCursor()
+        cursor.setPosition(new_cursor_pos)
+        self.input_box.setTextCursor(cursor)
+        self._hide_at_popup()
+
+    def _on_at_item_clicked(self, item: QListWidgetItem) -> None:
+        self._at_list.setCurrentItem(item)
+        self._commit_at_selection()
 
     def _remove_row(self, row: ChatBubbleRow) -> None:
         self.messages_layout.removeWidget(row)

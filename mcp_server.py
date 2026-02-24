@@ -1,6 +1,9 @@
-"""Local MCP server exposing read-only FoundationDetector inspection tools."""
+"""Local MCP server exposing FoundationDetector inspection and GUI-action tools."""
 from __future__ import annotations
 
+import json
+import time as _time
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional, Tuple
 
@@ -540,22 +543,36 @@ def _stat_spread(state, indices):
     }
     if state.coords_lv0 is not None:
         coords = state.coords_lv0[indices]
-        result["spatial_spread"] = {
+        spatial: Dict[str, Any] = {
             "std_x": float(coords[:, 0].std()), "std_y": float(coords[:, 1].std()),
             "mean_x": float(coords[:, 0].mean()), "mean_y": float(coords[:, 1].mean()),
         }
+        if state.mpp is not None:
+            px_to_mm = state.mpp * 1e-3
+            spatial["std_x_mm"] = round(float(coords[:, 0].std()) * px_to_mm, 4)
+            spatial["std_y_mm"] = round(float(coords[:, 1].std()) * px_to_mm, 4)
+            spatial["mpp"] = state.mpp
+        result["spatial_spread"] = spatial
     return result
 
 
 def _stat_area_covered(state, indices):
     if state.patch_size_lv0 is None:
         return {"error": "patch_size_lv0 not available"}
-    patch_area = float(state.patch_size_lv0) ** 2
-    return {
+    patch_size = float(state.patch_size_lv0)
+    patch_area_px2 = patch_size ** 2
+    result: Dict[str, Any] = {
         "patch_count": len(indices),
-        "patch_size_px": float(state.patch_size_lv0),
-        "area_px2": int(len(indices) * patch_area),
+        "patch_size_px": patch_size,
+        "area_px2": int(len(indices) * patch_area_px2),
     }
+    if state.mpp is not None:
+        px_to_mm = state.mpp * 1e-3
+        result["patch_size_um"] = round(patch_size * state.mpp, 2)
+        result["area_mm2"] = round(len(indices) * patch_area_px2 * px_to_mm ** 2, 6)
+        result["area_um2"] = round(len(indices) * patch_area_px2 * state.mpp ** 2, 2)
+        result["mpp"] = state.mpp
+    return result
 
 
 def _stat_area_bbox(state, indices):
@@ -565,13 +582,22 @@ def _stat_area_bbox(state, indices):
     pad = float(state.patch_size_lv0 or 0)
     w = float(coords[:, 0].max() - coords[:, 0].min()) + pad
     h = float(coords[:, 1].max() - coords[:, 1].min()) + pad
-    return {
+    result: Dict[str, Any] = {
         "width_px": int(w), "height_px": int(h), "area_px2": int(w * h),
         "bbox": {
             "x_min": int(coords[:, 0].min()), "y_min": int(coords[:, 1].min()),
             "x_max": int(coords[:, 0].max()), "y_max": int(coords[:, 1].max()),
         },
     }
+    if state.mpp is not None:
+        px_to_mm = state.mpp * 1e-3
+        result["width_mm"] = round(w * px_to_mm, 4)
+        result["height_mm"] = round(h * px_to_mm, 4)
+        result["area_mm2"] = round(w * h * px_to_mm ** 2, 6)
+        result["width_um"] = round(w * state.mpp, 1)
+        result["height_um"] = round(h * state.mpp, 1)
+        result["mpp"] = state.mpp
+    return result
 
 
 def _stat_area_hull(state, indices):
@@ -580,7 +606,17 @@ def _stat_area_hull(state, indices):
     try:
         from shapely.geometry import MultiPoint  # type: ignore
         hull = MultiPoint(state.coords_lv0[indices].tolist()).convex_hull
-        return {"area_px2": int(hull.area), "perimeter_px": int(hull.length)}
+        result: Dict[str, Any] = {
+            "area_px2": int(hull.area),
+            "perimeter_px": int(hull.length),
+        }
+        if state.mpp is not None:
+            px_to_mm = state.mpp * 1e-3
+            result["area_mm2"] = round(hull.area * px_to_mm ** 2, 6)
+            result["perimeter_mm"] = round(hull.length * px_to_mm, 4)
+            result["area_um2"] = round(hull.area * state.mpp ** 2, 2)
+            result["mpp"] = state.mpp
+        return result
     except Exception as exc:
         return {"error": f"shapely error: {exc}"}
 
@@ -670,6 +706,110 @@ def _compute_discriminating_dims(state, cluster_id: int) -> Dict[str, Any]:
     delta = np.abs(centroid - mean_other)
     top = np.argsort(delta)[::-1][:10]
     return {"top_10": [{"dim": int(d), "abs_delta": float(delta[d])} for d in top]}
+
+
+# ---------------------------------------------------------------------------
+# GUI action dispatch helper
+# ---------------------------------------------------------------------------
+
+def _dispatch_gui_action(
+    action_type: str,
+    params: Dict[str, Any],
+    timeout: float = 5.0,
+) -> Dict[str, Any]:
+    """Post a GUI action and block until the main thread executes it.
+
+    FastMCP runs sync tools in a thread-pool executor, so time.sleep here
+    blocks only the executor thread — not the asyncio event loop.
+    """
+    action_id = app_state.post_gui_action(action_type, params)
+    deadline = _time.monotonic() + timeout
+    while _time.monotonic() < deadline:
+        result = app_state.get_gui_action_result(action_id)
+        if result is not None:
+            return result
+        _time.sleep(0.05)
+    return {"error": f"GUI action '{action_type}' timed out after {timeout:.0f}s"}
+
+
+def _clip_score(value: float) -> float:
+    """Clamp a numeric score to [0, 100]."""
+    return max(0.0, min(100.0, float(value)))
+
+
+def _sample_patch_indices(
+    state: app_state.AppState,
+    candidate_indices: np.ndarray,
+    n_samples: int,
+    strategy: str,
+    include_boundary: bool,
+) -> Tuple[List[int], Dict[int, float], List[str]]:
+    """Sample patch indices from a candidate pool with optional boundary blend."""
+    warnings: List[str] = []
+    if len(candidate_indices) == 0:
+        return [], {}, warnings
+    if state.features is None:
+        return [], {}, ["No feature matrix available"]
+
+    n_samples = max(1, int(n_samples))
+    n_samples = min(n_samples, len(candidate_indices))
+    feats = state.features[candidate_indices]
+    centroid = feats.mean(axis=0)
+    centroid_d = np.linalg.norm(feats - centroid, axis=1)
+
+    if strategy == "centroid":
+        order = np.argsort(centroid_d)
+        picked = candidate_indices[order[:n_samples]]
+    elif strategy == "boundary":
+        order = np.argsort(centroid_d)[::-1]
+        picked = candidate_indices[order[:n_samples]]
+    else:  # diverse
+        pool = candidate_indices
+        pool_feats = feats
+        if len(candidate_indices) > 2000:
+            rng = np.random.default_rng(42)
+            keep = rng.choice(len(candidate_indices), 2000, replace=False)
+            pool = candidate_indices[keep]
+            pool_feats = feats[keep]
+            warnings.append("Diverse sampling pool capped to 2000 candidates for speed")
+
+        center = pool_feats.mean(axis=0)
+        center_d = np.linalg.norm(pool_feats - center, axis=1)
+        seed = int(np.argmin(center_d))
+        selected = [seed]
+        if n_samples > 1:
+            min_d = np.linalg.norm(pool_feats - pool_feats[seed], axis=1)
+            while len(selected) < min(n_samples, len(pool)):
+                nxt = int(np.argmax(min_d))
+                if nxt in selected:
+                    break
+                selected.append(nxt)
+                min_d = np.minimum(min_d, np.linalg.norm(pool_feats - pool_feats[nxt], axis=1))
+        picked = pool[selected]
+        if len(picked) < n_samples:
+            rem = [i for i in candidate_indices.tolist() if i not in set(picked.tolist())]
+            picked = np.array(picked.tolist() + rem[: (n_samples - len(picked))], dtype=int)
+
+    if include_boundary and strategy != "boundary" and len(candidate_indices) > n_samples:
+        boundary_n = max(1, n_samples // 4)
+        boundary = candidate_indices[np.argsort(centroid_d)[::-1][:boundary_n]]
+        merged: List[int] = []
+        seen = set()
+        for idx in np.concatenate([picked, boundary]):
+            idx_int = int(idx)
+            if idx_int in seen:
+                continue
+            seen.add(idx_int)
+            merged.append(idx_int)
+            if len(merged) >= n_samples:
+                break
+        picked = np.array(merged, dtype=int)
+
+    score_map: Dict[int, float] = {}
+    d_lookup = {int(i): float(d) for i, d in zip(candidate_indices.tolist(), centroid_d.tolist())}
+    for idx in picked.tolist():
+        score_map[int(idx)] = float(d_lookup.get(int(idx), 0.0))
+    return [int(i) for i in picked.tolist()], score_map, warnings
 
 
 # Dispatch registries
@@ -952,7 +1092,11 @@ def compute_cluster_feature_stats(cluster_id: int) -> Dict[str, Any]:
 
 
 @mcp.tool()
-def get_boundary_patches(top_k: int = 30) -> Dict[str, Any]:
+def get_boundary_patches(
+    top_k: int = 30,
+    cluster_a: Optional[int] = None,
+    cluster_b: Optional[int] = None,
+) -> Dict[str, Any]:
     """Identify patches that sit near cluster decision boundaries.
 
     For each patch computes the distance to its assigned centroid and to the
@@ -960,6 +1104,18 @@ def get_boundary_patches(top_k: int = 30) -> Dict[str, Any]:
     nearest_other_dist) are most uncertain / boundary-like.  Returns top_k
     such patches with patch index, assigned cluster, nearest other cluster,
     gap, and level-0 coordinates.
+
+    Parameters
+    ----------
+    top_k : int
+        Number of boundary patches to return.
+    cluster_a : int, optional
+        First cluster of a pair to filter to.  Must be used together with
+        cluster_b.  When both are set, only patches whose assigned cluster
+        and nearest other cluster are exactly {cluster_a, cluster_b} are
+        returned.
+    cluster_b : int, optional
+        Second cluster of a pair to filter to.
     """
     state = app_state.get()
     if state.features is None:
@@ -986,7 +1142,28 @@ def get_boundary_patches(top_k: int = 30) -> Dict[str, Any]:
     nearest_other_dist = temp[np.arange(n_patches), nearest_other_idx].astype(float)
 
     gap = nearest_other_dist - assigned_dist
-    order = np.argsort(gap)[: min(top_k, n_patches)]
+
+    # Optional cluster-pair filter
+    pair_filter = None
+    if cluster_a is not None and cluster_b is not None:
+        pair_set = {int(cluster_a), int(cluster_b)}
+        pair_filter = np.array([
+            {int(labels[i]), int(nearest_other_idx[i])} == pair_set
+            for i in range(n_patches)
+        ])
+        if not pair_filter.any():
+            return {
+                "top_k": 0,
+                "boundary_patches": [],
+                "cluster_pair": sorted(pair_set),
+                "note": f"No boundary patches found between clusters {cluster_a} and {cluster_b}",
+            }
+
+    if pair_filter is not None:
+        candidates = np.where(pair_filter)[0]
+        order = candidates[np.argsort(gap[candidates])[: min(top_k, len(candidates))]]
+    else:
+        order = np.argsort(gap)[: min(top_k, n_patches)]
 
     patches: List[Dict[str, Any]] = []
     for pi in order:
@@ -1005,11 +1182,14 @@ def get_boundary_patches(top_k: int = 30) -> Dict[str, Any]:
             }
         patches.append(entry)
 
-    return {
+    result = {
         "top_k": len(patches),
         "boundary_patches": patches,
         "note": "Sorted by gap (assigned_dist - nearest_other_dist); smaller gap = more uncertain",
     }
+    if cluster_a is not None and cluster_b is not None:
+        result["cluster_pair"] = sorted([int(cluster_a), int(cluster_b)])
+    return result
 
 
 @mcp.tool()
@@ -1469,6 +1649,836 @@ def rank_models_by_labeled_region_separability(
         "metric": metric,
         "ranking": results,
         "n_models_evaluated": len(results),
+        "warnings": warnings,
+    }
+
+
+# ---------------------------------------------------------------------------
+# GUI action tools — mutate live GUI state via queue + QTimer drain
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool()
+def expand_region(
+    region_id: int,
+    n_rings: int = 1,
+    name: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Expand a labeled region outward by N rings of spatially adjacent patches.
+
+    Uses 4-connected grid adjacency on the patch coordinate grid.  Each ring
+    adds all patches that share a grid edge with the current frontier.
+    Returns a new labeled region containing the original patches plus the
+    ring patches (via the create_agent_region GUI action).
+    """
+    state = app_state.get()
+    if state.features is None:
+        return {"error": "No slide loaded"}
+    if region_id not in state.labeled_regions:
+        return {"error": f"Region {region_id} not found"}
+
+    region = state.labeled_regions[region_id]
+    if not region.patch_indices:
+        return {"error": "Region has no patches"}
+
+    coords = state.coords_lv0 if state.coords_lv0 is not None else state.coords_thumb
+    if coords is None:
+        return {"error": "No coordinate data available"}
+    if state.patch_size_lv0 is None:
+        return {"error": "patch_size_lv0 not available"}
+
+    n_rings = max(1, int(n_rings))
+    step = int(round(state.patch_size_lv0))
+    coord_to_idx = {(int(coords[i, 0]), int(coords[i, 1])): i for i in range(len(coords))}
+
+    frontier: set = set(region.patch_indices)
+    expanded: set = set(region.patch_indices)
+    for _ in range(n_rings):
+        next_ring: set = set()
+        for idx in frontier:
+            x, y = int(coords[idx, 0]), int(coords[idx, 1])
+            for nx, ny in [(x + step, y), (x - step, y), (x, y + step), (x, y - step)]:
+                candidate = coord_to_idx.get((nx, ny))
+                if candidate is not None and candidate not in expanded:
+                    next_ring.add(candidate)
+        expanded |= next_ring
+        frontier = next_ring
+        if not frontier:
+            break
+
+    added_count = len(expanded) - len(region.patch_indices)
+    result = _dispatch_gui_action(
+        "create_agent_region",
+        {"patch_indices": sorted(expanded), "name": name, "source_region_id": region_id},
+    )
+    result["source_region_id"] = region_id
+    result["original_patch_count"] = len(region.patch_indices)
+    result["added_patches"] = added_count
+    result["n_rings"] = n_rings
+    return result
+
+
+@mcp.tool()
+def find_most_different_cluster(
+    region_ids: List[int],
+    metric: str = "cosine",
+    top_k: int = 3,
+) -> Dict[str, Any]:
+    """Find K-means cluster(s) most dissimilar to the combined centroid of labeled regions.
+
+    Computes the mean feature vector across all patches in the given regions,
+    then ranks all clusters by distance in descending order (most different first).
+    Accepts one or more region IDs to form a combined centroid.
+    """
+    state = app_state.get()
+    if state.features is None:
+        return {"error": "No slide loaded"}
+    if state.cluster_centroids is None:
+        return {"error": "Cluster centroids not available"}
+    if not region_ids:
+        return {"error": "region_ids must be a non-empty list"}
+    if metric not in ("cosine", "euclidean"):
+        return {"error": "metric must be 'cosine' or 'euclidean'"}
+
+    missing = [rid for rid in region_ids if rid not in state.labeled_regions]
+    if missing:
+        return {"error": f"Region IDs not found: {missing}. Use list_labeled_regions to see available."}
+
+    all_idx = np.concatenate([
+        np.array(list(state.labeled_regions[rid].patch_indices), dtype=int)
+        for rid in region_ids
+    ])
+    if len(all_idx) == 0:
+        return {"error": "Selected regions have no patches"}
+
+    combined_vec = state.features[all_idx].mean(axis=0, keepdims=True)  # (1, d)
+    centroids = state.cluster_centroids  # (k, d)
+
+    if metric == "cosine":
+        from sklearn.metrics.pairwise import cosine_distances  # type: ignore
+        dists = cosine_distances(combined_vec, centroids)[0]
+    else:
+        dists = np.linalg.norm(centroids - combined_vec, axis=1)
+
+    top_n = min(max(1, int(top_k)), len(centroids))
+    order = np.argsort(dists)[::-1][:top_n]
+    results = [
+        {
+            "cluster_id": int(c),
+            "distance": round(float(dists[c]), 6),
+            "patch_count": int((state.cluster_labels == c).sum()) if state.cluster_labels is not None else 0,
+        }
+        for c in order
+    ]
+    return {
+        "region_ids": region_ids,
+        "metric": metric,
+        "ranked_clusters": results,
+        "note": "Clusters ranked most-different first",
+    }
+
+
+@mcp.tool()
+def find_most_similar_cluster(
+    region_id: int,
+    metric: str = "cosine",
+    top_k: int = 3,
+) -> Dict[str, Any]:
+    """Find K-means cluster(s) whose centroid is most similar to a labeled region.
+
+    Uses the region's mean feature vector vs. each cluster centroid.
+    Returns ranked list of cluster_ids with similarity scores.
+    """
+    state = app_state.get()
+    if state.features is None:
+        return {"error": "No slide loaded"}
+    if state.cluster_centroids is None:
+        return {"error": "Cluster centroids not available"}
+    if region_id not in state.labeled_regions:
+        return {"error": f"Region {region_id} not found"}
+
+    region = state.labeled_regions[region_id]
+    idx = np.array(region.patch_indices, dtype=int)
+    region_vec = state.features[idx].mean(axis=0, keepdims=True)   # (1, d)
+    centroids = state.cluster_centroids                             # (k, d)
+
+    if metric == "cosine":
+        from sklearn.metrics.pairwise import cosine_distances  # type: ignore
+        dists = cosine_distances(region_vec, centroids)[0]
+    elif metric == "euclidean":
+        dists = np.linalg.norm(centroids - region_vec, axis=1)
+    else:
+        return {"error": "metric must be 'cosine' or 'euclidean'"}
+
+    order = np.argsort(dists)[:top_k]
+    results = [
+        {
+            "cluster_id": int(c),
+            "distance": round(float(dists[c]), 6),
+            "patch_count": int((state.cluster_labels == c).sum()),
+        }
+        for c in order
+    ]
+    return {"region_id": region_id, "metric": metric, "ranked_clusters": results}
+
+
+@mcp.tool()
+def label_cluster(
+    cluster_id: int,
+    name: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Tell the GUI to create a LabeledRegion for an entire K-means cluster.
+
+    Triggers the same radial-sweep animation as a manual cluster click.
+    Returns the new region_id or an error if the cluster is already labeled.
+    """
+    state = app_state.get()
+    if state.cluster_labels is None:
+        return {"error": "No slide loaded"}
+    n_clusters = len(state.cluster_centroids) if state.cluster_centroids is not None else 0
+    if cluster_id < 0 or cluster_id >= n_clusters:
+        return {"error": f"cluster_id {cluster_id} out of range [0, {n_clusters})"}
+    return _dispatch_gui_action("label_cluster", {"cluster_id": cluster_id, "name": name})
+
+
+@mcp.tool()
+def label_similar_cluster(
+    region_id: int,
+    name: Optional[str] = None,
+    metric: str = "cosine",
+) -> Dict[str, Any]:
+    """Find the K-means cluster most similar to a region and label it.
+
+    Convenience compound of find_most_similar_cluster + label_cluster.
+    """
+    best = find_most_similar_cluster(region_id=region_id, metric=metric, top_k=1)
+    if "error" in best:
+        return best
+    cluster_id = best["ranked_clusters"][0]["cluster_id"]
+    result = _dispatch_gui_action("label_cluster", {"cluster_id": cluster_id, "name": name})
+    result["source_region_id"] = region_id
+    result["chosen_cluster_id"] = cluster_id
+    result["distance"] = best["ranked_clusters"][0]["distance"]
+    return result
+
+
+@mcp.tool()
+def label_similar_patches_as_region(
+    region_id: int,
+    top_k: int = 30,
+    name: Optional[str] = None,
+    metric: str = "cosine",
+) -> Dict[str, Any]:
+    """Find the top-K patches most similar to a region and create a new labeled region.
+
+    Chains find_similar_patches → create_agent_region GUI action.
+    The new region uses the most common cluster label among the found patches.
+    """
+    similar = find_similar_patches(region_id=region_id, top_k=top_k, metric=metric)
+    if "error" in similar:
+        return similar
+    patch_indices = [p["patch_index"] for p in similar.get("similar_patches", [])]
+    if not patch_indices:
+        return {"error": "No similar patches found"}
+    return _dispatch_gui_action(
+        "create_agent_region",
+        {"patch_indices": patch_indices, "name": name, "source_region_id": region_id},
+    )
+
+
+@mcp.tool()
+def delete_region(region_id: int) -> Dict[str, Any]:
+    """Delete a labeled region from the GUI."""
+    state = app_state.get()
+    if region_id not in state.labeled_regions:
+        return {"error": f"Region {region_id} not found"}
+    return _dispatch_gui_action("delete_region", {"region_id": region_id})
+
+
+@mcp.tool()
+def rename_region(region_id: int, new_name: str) -> Dict[str, Any]:
+    """Rename a labeled region."""
+    state = app_state.get()
+    if region_id not in state.labeled_regions:
+        return {"error": f"Region {region_id} not found"}
+    if not new_name or not new_name.strip():
+        return {"error": "new_name must be a non-empty string"}
+    return _dispatch_gui_action(
+        "rename_region", {"region_id": region_id, "new_name": new_name.strip()}
+    )
+
+
+@mcp.tool()
+def navigate_to_region(region_id: int, padding_fraction: float = 0.15) -> Dict[str, Any]:
+    """Pan and zoom the slide view to show a labeled region.
+
+    padding_fraction: fraction of bounding-box size to add as margin (default 0.15).
+    """
+    state = app_state.get()
+    if region_id not in state.labeled_regions:
+        return {"error": f"Region {region_id} not found"}
+    if state.coords_lv0 is None and state.coords_thumb is None:
+        return {"error": "No coordinate data available"}
+    return _dispatch_gui_action(
+        "navigate_to_region",
+        {"region_id": region_id, "padding_fraction": padding_fraction},
+    )
+
+
+@mcp.tool()
+def create_region_from_patches(
+    patch_indices: List[int],
+    name: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Create a new labeled region from an explicit list of patch indices.
+
+    Useful after find_similar_patches: pass the returned patch_index values here.
+    The region will have source_mode='local' and use the most common cluster label
+    among the given patches as its kmeans_cluster reference.
+    """
+    state = app_state.get()
+    if state.features is None:
+        return {"error": "No slide loaded"}
+    if not patch_indices:
+        return {"error": "patch_indices must be a non-empty list"}
+    n = len(state.features)
+    bad = [i for i in patch_indices if i < 0 or i >= n]
+    if bad:
+        return {"error": f"Out-of-range patch indices: {bad[:5]}"}
+    return _dispatch_gui_action(
+        "create_agent_region",
+        {"patch_indices": list(patch_indices), "name": name, "source_region_id": None},
+    )
+
+
+@mcp.tool()
+def select_cluster(cluster_id: int) -> Dict[str, Any]:
+    """Highlight a K-means cluster in both slide and scatter views.
+
+    Creates a LabeledRegion with the radial-sweep animation, same as a
+    manual cluster click. Unlike deselect_all_clusters, this adds a selection.
+    """
+    state = app_state.get()
+    if state.cluster_labels is None:
+        return {"error": "No slide loaded"}
+    n_clusters = len(state.cluster_centroids) if state.cluster_centroids is not None else 0
+    if cluster_id < 0 or cluster_id >= n_clusters:
+        return {"error": f"cluster_id {cluster_id} out of range [0, {n_clusters})"}
+    return _dispatch_gui_action("select_cluster", {"cluster_id": cluster_id})
+
+
+@mcp.tool()
+def clear_all_regions() -> Dict[str, Any]:
+    """Remove all labeled regions from the GUI."""
+    return _dispatch_gui_action("clear_all_regions", {})
+
+
+@mcp.tool()
+def deselect_all_clusters() -> Dict[str, Any]:
+    """Clear the cluster selection highlight in slide and scatter views."""
+    return _dispatch_gui_action("deselect_all_clusters", {})
+
+
+@mcp.tool()
+def set_cluster_count(k: int) -> Dict[str, Any]:
+    """Change the K-means cluster count and trigger re-clustering.
+
+    Sets the cluster spinbox to the given value and re-runs clustering on the
+    currently loaded slide.  Valid range: 2–10.
+    """
+    state = app_state.get()
+    if state.features is None:
+        return {"error": "No slide loaded"}
+    if k < 2 or k > 10:
+        return {"error": f"k must be between 2 and 10 (got {k})"}
+    return _dispatch_gui_action("set_cluster_count", {"k": k})
+
+
+@mcp.tool()
+def load_slide(slide_name: str) -> Dict[str, Any]:
+    """Switch the active slide in the GUI.
+
+    Selects a different slide from the loaded directory.  The slide must
+    already be discovered (use list_data to see available slides).  Triggers
+    thumbnail loading and, if a model selection is active, feature loading
+    and clustering.
+    """
+    state = app_state.get()
+    if state.root_dir is None:
+        return {"error": "No root directory loaded"}
+    return _dispatch_gui_action("load_slide", {"slide_name": slide_name}, timeout=15.0)
+
+
+@mcp.tool()
+def lookup_patch_by_coords(x: int, y: int) -> Dict[str, Any]:
+    """Find the patch nearest to a given level-0 coordinate.
+
+    Returns the patch index, cluster assignment, level-0 coordinates, and
+    region membership (if any) of the closest patch.  Useful when a
+    pathologist references a spatial position from the slide.
+    """
+    state = app_state.get()
+    if state.features is None:
+        return {"error": "No slide loaded"}
+    if state.coords_lv0 is None:
+        return {"error": "No level-0 coordinates available"}
+
+    target = np.array([x, y], dtype=np.float32)
+    dists = np.linalg.norm(state.coords_lv0 - target, axis=1)
+    nearest_idx = int(np.argmin(dists))
+    nearest_dist = float(dists[nearest_idx])
+
+    result: Dict[str, Any] = {
+        "patch_index": nearest_idx,
+        "coords_lv0": {
+            "x": int(state.coords_lv0[nearest_idx, 0]),
+            "y": int(state.coords_lv0[nearest_idx, 1]),
+        },
+        "distance_px": round(nearest_dist, 1),
+    }
+
+    if state.cluster_labels is not None:
+        result["cluster_id"] = int(state.cluster_labels[nearest_idx])
+
+    # Check region membership
+    regions_containing: List[Dict[str, Any]] = []
+    for rid, r in state.labeled_regions.items():
+        if nearest_idx in r.patch_indices:
+            regions_containing.append({"region_id": rid, "name": r.name})
+    result["regions"] = regions_containing
+
+    return result
+
+
+@mcp.tool()
+def export_regions_geojson(output_path: Optional[str] = None) -> Dict[str, Any]:
+    """Export all labeled regions to a GeoJSON file.
+
+    If output_path is omitted, a default path is generated next to the
+    slide image.  Returns the path of the written file.
+    """
+    state = app_state.get()
+    if state.features is None:
+        return {"error": "No slide loaded"}
+    if not state.labeled_regions:
+        return {"error": "No labeled regions to export"}
+    params: Dict[str, Any] = {}
+    if output_path:
+        params["output_path"] = output_path
+    return _dispatch_gui_action("export_regions_geojson", params, timeout=10.0)
+
+
+@mcp.tool()
+def switch_to_atlas_view() -> Dict[str, Any]:
+    """Switch the GUI sidebar to the Atlas view tab.
+
+    Requires an atlas to have been built in the GUI first.
+    Triggers the same tab-switch that sets atlas labels on the slide and scatter views.
+    """
+    state = app_state.get()
+    if state.atlas_state is None:
+        return {"error": "No atlas has been built yet"}
+    return _dispatch_gui_action("switch_to_atlas_view", {})
+
+
+@mcp.tool()
+def highlight_atlas_cluster(cluster_id: int) -> Dict[str, Any]:
+    """Highlight a cluster across all atlas slide thumbnails and the atlas scatter view.
+
+    Requires an atlas to have been built in the GUI first.
+    Useful after switch_to_atlas_view to draw the user's attention to a specific
+    tissue type across all slides.
+    """
+    state = app_state.get()
+    if state.atlas_state is None:
+        return {"error": "No atlas has been built yet"}
+    n_clusters = state.atlas_state.n_clusters
+    if cluster_id < 0 or cluster_id >= n_clusters:
+        return {"error": f"cluster_id {cluster_id} out of range [0, {n_clusters})"}
+    return _dispatch_gui_action("highlight_atlas_cluster", {"cluster_id": cluster_id})
+
+
+@mcp.tool()
+def open_patch_exemplar_popup(
+    source_type: Literal["cluster", "region", "patch_list"],
+    source_id: Optional[int] = None,
+    patch_indices: Optional[List[int]] = None,
+    n_samples: int = 24,
+    strategy: Literal["centroid", "diverse", "boundary"] = "diverse",
+    include_boundary: bool = True,
+    include_metadata: bool = True,
+) -> Dict[str, Any]:
+    """Open a horizontally scrollable patch exemplar popup in the GUI."""
+    state = app_state.get()
+    if state.features is None:
+        return {"error": "No slide loaded"}
+
+    candidates: List[int] = []
+    source_label = ""
+    if source_type == "cluster":
+        if source_id is None:
+            return {"error": "source_id is required for source_type='cluster'"}
+        if state.cluster_labels is None:
+            return {"error": "Cluster labels are not available"}
+        candidates = np.where(state.cluster_labels == int(source_id))[0].astype(int).tolist()
+        source_label = f"Cluster {int(source_id)}"
+    elif source_type == "region":
+        if source_id is None:
+            return {"error": "source_id is required for source_type='region'"}
+        rid = int(source_id)
+        if rid not in state.labeled_regions:
+            return {"error": f"Region {rid} not found"}
+        candidates = [int(i) for i in state.labeled_regions[rid].patch_indices]
+        source_label = f"Region {rid}"
+    else:
+        if not patch_indices:
+            return {"error": "patch_indices must be provided for source_type='patch_list'"}
+        total = int(len(state.features))
+        bad = [int(i) for i in patch_indices if int(i) < 0 or int(i) >= total]
+        if bad:
+            return {"error": f"Out-of-range patch indices: {bad[:10]}"}
+        candidates = [int(i) for i in patch_indices]
+        source_label = "Custom Patch List"
+
+    if not candidates:
+        return {"error": "No candidate patches found for requested source"}
+
+    sampled, score_map, warnings = _sample_patch_indices(
+        state=state,
+        candidate_indices=np.array(candidates, dtype=int),
+        n_samples=n_samples,
+        strategy=strategy,
+        include_boundary=include_boundary,
+    )
+    if not sampled:
+        return {"error": "Failed to sample exemplar patches", "warnings": warnings}
+
+    popup_id = f"exemplar-{int(_time.time() * 1000)}"
+    result = _dispatch_gui_action(
+        "open_patch_exemplar_popup",
+        {
+            "popup_id": popup_id,
+            "source_type": source_type,
+            "source_id": source_id,
+            "source_label": source_label,
+            "strategy": strategy,
+            "include_metadata": bool(include_metadata),
+            "patch_indices": sampled,
+            "scores_by_patch": score_map,
+        },
+        timeout=15.0,
+    )
+    if isinstance(result, dict):
+        result.setdefault("popup_id", popup_id)
+        result.setdefault("sample_indices", sampled)
+        if warnings:
+            existing = result.get("warnings") or []
+            result["warnings"] = list(existing) + warnings
+    return result
+
+
+@mcp.tool()
+def export_current_exemplar_popup(
+    popup_id: str,
+    output_dir: Optional[str] = None,
+    format: Literal["png"] = "png",
+    include_manifest: bool = True,
+) -> Dict[str, Any]:
+    """Export currently rendered exemplar images from the in-app popup."""
+    params: Dict[str, Any] = {
+        "popup_id": popup_id,
+        "format": format,
+        "include_manifest": bool(include_manifest),
+    }
+    if output_dir:
+        params["output_dir"] = output_dir
+    return _dispatch_gui_action("export_current_exemplar_popup", params, timeout=15.0)
+
+
+@mcp.tool()
+def close_exemplar_popup(popup_id: str) -> Dict[str, Any]:
+    """Close the active exemplar popup if it matches popup_id."""
+    return _dispatch_gui_action("close_exemplar_popup", {"popup_id": popup_id})
+
+
+@mcp.tool()
+def generate_slide_qc_report(
+    root_dir: str,
+    slide_name: str,
+    model: str,
+    mag: str,
+    patch_size: str,
+    output_path: Optional[str] = None,
+    include_recommendations: bool = True,
+    cluster_k_candidates: Optional[List[int]] = None,
+) -> Dict[str, Any]:
+    """Generate a deterministic QC report (Markdown + JSON summary) for one configuration."""
+    root = _resolve_root(root_dir)
+    describe = describe_slide(root_dir, slide_name, model, mag, patch_size)
+    if "error" in describe:
+        return describe
+
+    warnings: List[str] = []
+    warnings.extend(describe.get("warnings", []))
+
+    try:
+        h5_path = _resolve_h5_path(root, slide_name, model, mag, patch_size)
+    except FileNotFoundError as exc:
+        return {"error": str(exc)}
+    features, _, _, attrs = _load_features_and_coords(h5_path)
+    patch_count = int(features.shape[0])
+    feature_dim = int(features.shape[1])
+
+    raw_candidates = cluster_k_candidates or [4, 6, 8, 10]
+    k_candidates = sorted({int(k) for k in raw_candidates if int(k) >= 2})
+    k_candidates = [k for k in k_candidates if k < patch_count]
+    if not k_candidates:
+        k_candidates = [max(2, min(8, patch_count - 1))]
+        warnings.append("k candidate list was invalid; using a fallback candidate")
+
+    k_sweep: List[Dict[str, Any]] = []
+    for k in k_candidates:
+        labels, inertia = _run_clustering(features, k)
+        scores = _clustering_scores(features, labels)
+        k_sweep.append(
+            {
+                "k": int(k),
+                "inertia": float(inertia),
+                "silhouette_score": float(scores["silhouette_score"]),
+                "davies_bouldin_index": float(scores["davies_bouldin_index"]),
+            }
+        )
+
+    elbow = compute_elbow_analysis(
+        root_dir=root_dir,
+        slide_name=slide_name,
+        model=model,
+        mag=mag,
+        patch_size=patch_size,
+        max_k=min(20, max(max(k_candidates), 10)),
+    )
+    if "error" not in elbow:
+        warnings.extend(elbow.get("warnings", []))
+    recommended_k = int(elbow.get("recommended_k", k_candidates[0]))
+    if recommended_k not in k_candidates:
+        best_by_sil = sorted(k_sweep, key=lambda x: x["silhouette_score"], reverse=True)[0]["k"]
+        warnings.append(
+            f"Elbow suggested k={recommended_k}, outside evaluated set; using best evaluated k={best_by_sil}"
+        )
+        recommended_k = int(best_by_sil)
+
+    model_rank = rank_models_by_separability(
+        root_dir=root_dir,
+        slide_name=slide_name,
+        mag=mag,
+        patch_size=patch_size,
+        n_clusters=recommended_k,
+    )
+    ranking = model_rank.get("ranking", [])
+    warnings.extend(model_rank.get("warnings", []))
+    current_rank_entry = next((r for r in ranking if r.get("model") == model), None)
+
+    state = app_state.get()
+    pca_context_available = (
+        state.slide_name == slide_name
+        and state.embedding_2d is not None
+        and state.pca_explained_variance_ratio is not None
+    )
+    if pca_context_available:
+        pca_ratio = [float(x) for x in state.pca_explained_variance_ratio or []]
+    else:
+        pca_ratio = []
+        warnings.append(
+            "Live PCA context unavailable for this slide/model; embedding fidelity section is limited"
+        )
+    pca_cumulative = float(sum(pca_ratio)) if pca_ratio else 0.0
+
+    # Score model
+    integrity = 100.0
+    if patch_count < 200:
+        integrity -= 30.0
+        warnings.append("Patch count is low (<200), reducing robustness of clustering metrics")
+    if feature_dim < 32:
+        integrity -= 20.0
+    if not attrs:
+        integrity -= 5.0
+    integrity -= min(40.0, 10.0 * len(describe.get("warnings", [])))
+    data_integrity_score = _clip_score(integrity)
+
+    best_sil = max(float(x["silhouette_score"]) for x in k_sweep)
+    best_dbi = min(float(x["davies_bouldin_index"]) for x in k_sweep)
+    silhouette_norm = ((best_sil + 1.0) / 2.0) * 100.0
+    dbi_norm = (1.0 / (1.0 + max(best_dbi, 1e-6))) * 100.0
+    cluster_quality_score = _clip_score(0.7 * silhouette_norm + 0.3 * dbi_norm)
+
+    if ranking and current_rank_entry:
+        n_models = max(1, int(len(ranking)))
+        rank_idx = int(current_rank_entry.get("rank", n_models))
+        model_fitness_score = _clip_score((n_models - rank_idx + 1) / n_models * 100.0)
+    else:
+        model_fitness_score = 50.0
+        warnings.append("Could not determine current model's separability rank")
+
+    if pca_ratio:
+        embedding_fidelity_score = _clip_score(pca_cumulative * 100.0)
+    else:
+        embedding_fidelity_score = 35.0
+
+    overall_score = _clip_score(
+        0.35 * data_integrity_score
+        + 0.30 * cluster_quality_score
+        + 0.20 * model_fitness_score
+        + 0.15 * embedding_fidelity_score
+    )
+    if overall_score >= 85:
+        grade = "A"
+    elif overall_score >= 70:
+        grade = "B"
+    elif overall_score >= 55:
+        grade = "C"
+    else:
+        grade = "D"
+
+    recommendations: List[Dict[str, str]] = []
+    if include_recommendations:
+        if current_rank_entry and int(current_rank_entry.get("rank", 1)) > 1 and ranking:
+            top = ranking[0]
+            recommendations.append(
+                {
+                    "recommendation": f"Consider switching to model '{top['model']}' for stronger separability on this slide.",
+                    "confidence": "high",
+                    "rationale": "Model ranking by silhouette score",
+                }
+            )
+        if recommended_k != 8:
+            recommendations.append(
+                {
+                    "recommendation": f"Use k={recommended_k} as default for this slide/model instead of a fixed k.",
+                    "confidence": "medium",
+                    "rationale": "Elbow + evaluated k sweep",
+                }
+            )
+        if pca_ratio and pca_cumulative < 0.35:
+            recommendations.append(
+                {
+                    "recommendation": "Treat 2D scatter interpretation as qualitative only; substantial variance is outside PC1/PC2.",
+                    "confidence": "high",
+                    "rationale": "Low PCA cumulative explained variance",
+                }
+            )
+
+    summary_json = {
+        "slide_name": slide_name,
+        "model": model,
+        "mag": mag,
+        "patch_size": patch_size,
+        "scores": {
+            "data_integrity_score": round(data_integrity_score, 2),
+            "cluster_quality_score": round(cluster_quality_score, 2),
+            "model_fitness_score": round(model_fitness_score, 2),
+            "embedding_fidelity_score": round(embedding_fidelity_score, 2),
+            "overall_score": round(overall_score, 2),
+            "grade": grade,
+        },
+        "recommended_k": int(recommended_k),
+        "k_sweep": k_sweep,
+        "model_rank": current_rank_entry,
+        "n_models_ranked": len(ranking),
+        "pca_explained_variance_ratio": pca_ratio,
+        "pca_cumulative": round(pca_cumulative, 4),
+        "warnings": warnings,
+        "recommendations": recommendations,
+    }
+
+    report_dir = root / "Reports"
+    report_dir.mkdir(parents=True, exist_ok=True)
+    default_name = (
+        f"qc_{slide_name}_{model}_{mag}_{patch_size}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.md"
+    )
+    final_path = Path(output_path).expanduser() if output_path else (report_dir / default_name)
+    if not final_path.is_absolute():
+        final_path = (Path.cwd() / final_path).resolve()
+    final_path.parent.mkdir(parents=True, exist_ok=True)
+
+    def _fmt(v: float) -> str:
+        return f"{v:.3f}"
+
+    lines: List[str] = [
+        f"# QC Report: {slide_name} | {model} | {mag} | {patch_size}",
+        "",
+        "## Run Metadata",
+        f"- Generated: {datetime.now().isoformat(timespec='seconds')}",
+        f"- Root directory: `{str(root)}`",
+        f"- H5 path: `{str(h5_path)}`",
+        "",
+        "## Data Integrity Checks",
+        f"- Patch count: **{patch_count}**",
+        f"- Feature dimension: **{feature_dim}**",
+        f"- H5 attributes found: **{len(attrs)}**",
+        f"- Integrity score: **{data_integrity_score:.1f}/100**",
+        "",
+        "## Cluster Quality Analysis",
+        "| k | silhouette | davies_bouldin | inertia |",
+        "|---:|---:|---:|---:|",
+    ]
+    for row in k_sweep:
+        lines.append(
+            f"| {row['k']} | {_fmt(row['silhouette_score'])} | {_fmt(row['davies_bouldin_index'])} | {_fmt(row['inertia'])} |"
+        )
+    lines.extend(
+        [
+            "",
+            f"- Recommended k: **{recommended_k}**",
+            f"- Cluster quality score: **{cluster_quality_score:.1f}/100**",
+            "",
+            "## Model Benchmarking",
+            f"- Models evaluated: **{len(ranking)}**",
+        ]
+    )
+    if current_rank_entry:
+        lines.append(
+            f"- Current model rank: **{current_rank_entry.get('rank')} / {len(ranking)}** "
+            f"(silhouette={_fmt(float(current_rank_entry.get('silhouette_score', 0.0)))})"
+        )
+    else:
+        lines.append("- Current model rank: **N/A**")
+    lines.extend(
+        [
+            f"- Model fitness score: **{model_fitness_score:.1f}/100**",
+            "",
+            "## Embedding Fidelity",
+            f"- PCA explained variance ratio: `{pca_ratio}`",
+            f"- PCA cumulative (PC1+PC2): **{pca_cumulative:.3f}**",
+            f"- Embedding fidelity score: **{embedding_fidelity_score:.1f}/100**",
+            "",
+            "## Overall QC",
+            f"- Overall score: **{overall_score:.1f}/100**",
+            f"- Grade: **{grade}**",
+            "",
+        ]
+    )
+    if recommendations:
+        lines.append("## Recommendations")
+        for rec in recommendations:
+            lines.append(
+                f"- {rec['recommendation']} ({rec['confidence']}; rationale: {rec['rationale']})"
+            )
+        lines.append("")
+    lines.append("## Warnings / Limitations")
+    if warnings:
+        for warning in warnings:
+            lines.append(f"- {warning}")
+    else:
+        lines.append("- None")
+
+    final_path.write_text("\n".join(lines), encoding="utf-8")
+    json_path = final_path.with_suffix(".json")
+    json_path.write_text(json.dumps(summary_json, indent=2), encoding="utf-8")
+    return {
+        "report_path": str(final_path),
+        "summary_json_path": str(json_path),
+        "summary_json": summary_json,
+        "scores": summary_json["scores"],
         "warnings": warnings,
     }
 

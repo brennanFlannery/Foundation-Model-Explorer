@@ -89,6 +89,32 @@ class PreferencesDialog(QDialog):
         feature_group.setLayout(feature_layout)
         layout.addWidget(feature_group)
 
+        # Region Embeddings Group
+        region_group = QGroupBox("Region Embeddings")
+        region_layout = QVBoxLayout()
+
+        patches_row = QHBoxLayout()
+        patches_row.addWidget(QLabel("Patches per region (M):"))
+        self.patches_per_region_spin = QSpinBox()
+        self.patches_per_region_spin.setRange(3, 500)
+        self.patches_per_region_spin.setValue(
+            self.settings.value("patches_per_region", 15, type=int)
+        )
+        patches_row.addWidget(self.patches_per_region_spin)
+        patches_row.addStretch()
+        region_layout.addLayout(patches_row)
+
+        region_help = QLabel(
+            "N = ceil(cluster_size / M) subclusters per K-means group. "
+            "Each subcluster appears as an X marker in the Region Embedding View."
+        )
+        region_help.setWordWrap(True)
+        region_help.setStyleSheet("color: gray; font-size: 9pt;")
+        region_layout.addWidget(region_help)
+
+        region_group.setLayout(region_layout)
+        layout.addWidget(region_group)
+
         # AI Agent Group
         agent_group = QGroupBox("AI Agent")
         agent_layout = QVBoxLayout()
@@ -174,6 +200,7 @@ class PreferencesDialog(QDialog):
         """Save settings and close dialog."""
         # Save settings
         self.settings.setValue("normalize_features", self.normalize_checkbox.isChecked())
+        self.settings.setValue("patches_per_region", self.patches_per_region_spin.value())
         self.settings.setValue("chat_enabled", self.chat_enabled_checkbox.isChecked())
         self.settings.setValue("chat_secrets_path", self.chat_secrets_path.text().strip())
         self.settings.setValue("chat_model", self.chat_model_combo.currentText().strip())

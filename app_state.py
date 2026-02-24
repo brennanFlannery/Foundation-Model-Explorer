@@ -6,8 +6,10 @@ mcp_server.py tools read from here.
 from __future__ import annotations
 
 import threading
+import queue as _queue
+import uuid as _uuid
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional, Set
 
 import numpy as np
 
@@ -73,6 +75,44 @@ class AppState:
 
 _lock = threading.RLock()
 _state = AppState()
+
+# ---------------------------------------------------------------------------
+# GUI action queue — MCP tools post here; main-thread QTimer drains
+# ---------------------------------------------------------------------------
+
+_gui_action_queue: _queue.SimpleQueue = _queue.SimpleQueue()
+_gui_action_results: Dict[str, Any] = {}
+_gui_results_lock = threading.Lock()
+
+
+def post_gui_action(action_type: str, params: Dict[str, Any]) -> str:
+    """Enqueue a GUI action. Returns action_id for polling."""
+    action_id = str(_uuid.uuid4())
+    _gui_action_queue.put({"action_id": action_id, "action_type": action_type, "params": params})
+    return action_id
+
+
+def set_gui_action_result(action_id: str, result: Any) -> None:
+    """Store result for a completed GUI action."""
+    with _gui_results_lock:
+        _gui_action_results[action_id] = result
+
+
+def get_gui_action_result(action_id: str) -> Optional[Any]:
+    """Return and remove the result, or None if not yet ready."""
+    with _gui_results_lock:
+        return _gui_action_results.pop(action_id, None)
+
+
+def drain_gui_actions() -> List[Dict[str, Any]]:
+    """Drain all pending actions. Called from main-thread QTimer."""
+    actions = []
+    while True:
+        try:
+            actions.append(_gui_action_queue.get_nowait())
+        except _queue.Empty:
+            break
+    return actions
 
 
 def update(**kwargs) -> None:

@@ -57,7 +57,7 @@ from PySide6.QtGui import QPen, QBrush
 from PySide6.QtCore import QRectF
 from PIL import Image
 import data_loader
-from utils import generate_palette, cluster_features, infer_slide_dims, radial_sweep_order, normalize_to_scene
+from utils import generate_palette, cluster_features, infer_slide_dims, radial_sweep_order, normalize_to_scene, RegionInfo
 from PySide6.QtCore import Signal
 
 
@@ -484,4 +484,158 @@ class ScatterGraphicsView(QGraphicsView):
         x, y = scene_pos.x(), scene_pos.y()
         print(f"DEBUG: Scatter local region click at ({x}, {y}) with radius {self._local_region_radius}")
         self.local_region_selected.emit((x, y), self._local_region_radius)
+
+
+class RegionScatterItem(QObject, QGraphicsItem):
+    """X-marker graphics item representing a macro-region in the region embedding view.
+
+    Each item represents a spatial subgroup of ~M patches, positioned at
+    its 2D PCA embedding coordinate and colored by its parent K-means cluster.
+
+    Signals
+    -------
+    clicked(int)
+        Emitted with region_index when left-clicked.
+    hovered(int, bool)
+        Emitted with (region_index, True/False) on hover enter/leave.
+    """
+    clicked = Signal(int)
+    hovered = Signal(int, bool)
+
+    _ARM_LEN = 8.0
+    _PEN_WIDTH = 2.5
+
+    def __init__(self, region_index: int, kmeans_cluster: int,
+                 x: float, y: float, color: "QColor"):
+        QGraphicsItem.__init__(self)
+        QObject.__init__(self)
+        self._region_index = region_index
+        self._kmeans_cluster = kmeans_cluster
+        self._color = color
+        self.setPos(QPointF(x, y))
+        self.setAcceptHoverEvents(True)
+        self.setZValue(10)
+        self.setOpacity(0.85)
+
+    def boundingRect(self) -> "QRectF":
+        pad = self._ARM_LEN + self._PEN_WIDTH
+        return QRectF(-pad, -pad, 2 * pad, 2 * pad)
+
+    def paint(self, painter, option, widget=None) -> None:
+        pen = QPen(self._color, self._PEN_WIDTH)
+        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        painter.setPen(pen)
+        a = self._ARM_LEN
+        painter.drawLine(QPointF(-a, -a), QPointF(a, a))
+        painter.drawLine(QPointF(a, -a), QPointF(-a, a))
+
+    def hoverEnterEvent(self, event) -> None:
+        self.setOpacity(1.0)
+        self.hovered.emit(self._region_index, True)
+        super().hoverEnterEvent(event)
+
+    def hoverLeaveEvent(self, event) -> None:
+        self.setOpacity(0.85)
+        self.hovered.emit(self._region_index, False)
+        super().hoverLeaveEvent(event)
+
+    def mousePressEvent(self, event) -> None:
+        if event.button() == Qt.LeftButton:
+            self.clicked.emit(self._region_index)
+        super().mousePressEvent(event)
+
+
+class RegionScatterView(QGraphicsView):
+    """View for displaying macro-region embedding as X markers.
+
+    Each X marker represents a spatial subgroup of patches within a K-means
+    cluster. Clicking an X triggers creation of a local region annotation.
+
+    Signals
+    -------
+    region_clicked(int)
+        Emitted with region_index when a marker is clicked.
+    region_hovered(int, bool)
+        Emitted with (region_index, state) on hover enter/leave.
+    """
+    region_clicked = Signal(int)
+    region_hovered = Signal(int, bool)
+
+    def __init__(self, parent: Optional[QWidget] = None):
+        super().__init__(parent)
+        self.setScene(QGraphicsScene(self))
+        self.setRenderHints(self.renderHints() | QPainter.Antialiasing)
+        self.setTransformationAnchor(QGraphicsView.ViewportAnchor.AnchorUnderMouse)
+        self.setDragMode(QGraphicsView.DragMode.NoDrag)
+        self._region_items: List[RegionScatterItem] = []
+        self._was_panning = False
+
+    def populate(self, coords_2d: np.ndarray, regions: List[RegionInfo],
+                 cluster_colors_q: List["QColor"]) -> None:
+        """Populate the scene with X markers for each region."""
+        scene = self.scene()
+        scene.clear()
+        self._region_items.clear()
+
+        if coords_2d is None or len(regions) == 0:
+            return
+
+        norm_coords = normalize_to_scene(coords_2d, width=400, height=400, padding=20)
+
+        for region, (x, y) in zip(regions, norm_coords):
+            cluster_id = region.kmeans_cluster
+            color = (cluster_colors_q[cluster_id]
+                     if cluster_id < len(cluster_colors_q) else QColor("red"))
+            item = RegionScatterItem(region.region_index, cluster_id, x, y, color)
+            item.clicked.connect(self.region_clicked)
+            item.hovered.connect(self.region_hovered)
+            scene.addItem(item)
+            self._region_items.append(item)
+
+        padding = 20
+        scene.setSceneRect(0, 0, 400 + 2 * padding, 400 + 2 * padding)
+        self.fitInView(scene.sceneRect(), Qt.KeepAspectRatio)
+
+    def clear(self) -> None:
+        """Clear all markers from the scene."""
+        self.scene().clear()
+        self._region_items.clear()
+
+    def wheelEvent(self, event) -> None:
+        factor = 1.2 if event.angleDelta().y() > 0 else 0.8
+        self.scale(factor, factor)
+        event.accept()
+
+    def mousePressEvent(self, event) -> None:
+        if event.button() == Qt.MouseButton.MiddleButton:
+            self.setDragMode(QGraphicsView.DragMode.ScrollHandDrag)
+            self._was_panning = True
+            # Forward as left button press for Qt native drag
+            from PySide6.QtGui import QMouseEvent
+            from PySide6.QtCore import QEvent
+            synthetic = QMouseEvent(
+                event.type(), event.position(), event.globalPosition(),
+                Qt.MouseButton.LeftButton,
+                Qt.MouseButton.LeftButton | event.buttons(),
+                event.modifiers(),
+            )
+            super().mousePressEvent(synthetic)
+            return
+        super().mousePressEvent(event)
+
+    def mouseReleaseEvent(self, event) -> None:
+        if self._was_panning and event.button() == Qt.MouseButton.MiddleButton:
+            from PySide6.QtGui import QMouseEvent
+            from PySide6.QtCore import QEvent
+            synthetic = QMouseEvent(
+                event.type(), event.position(), event.globalPosition(),
+                Qt.MouseButton.LeftButton,
+                event.buttons(),
+                event.modifiers(),
+            )
+            super().mouseReleaseEvent(synthetic)
+            self.setDragMode(QGraphicsView.DragMode.NoDrag)
+            self._was_panning = False
+            return
+        super().mouseReleaseEvent(event)
 

@@ -71,9 +71,10 @@ from __future__ import annotations
 import json
 import os
 import uuid
+from datetime import datetime
 from dataclasses import dataclass
 from enum import Enum
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 import numpy as np
 from shapely.geometry import box
 from shapely.ops import unary_union
@@ -134,10 +135,16 @@ from PySide6.QtCore import QRectF
 from PIL import Image
 from PIL.ImageQt import ImageQt
 import data_loader
-from utils import generate_palette, cluster_features, infer_slide_dims, radial_sweep_order
+from utils import (
+    generate_palette, cluster_features, infer_slide_dims, radial_sweep_order,
+    compute_spatial_subclusters, compute_region_pca_embedding, RegionInfo,
+)
 from PySide6.QtCore import Signal
 
-from scatter_view import ScatterGraphicsItem, ScatterGraphicsView
+from scatter_view import (
+    ScatterGraphicsItem, ScatterGraphicsView,
+    RegionScatterView, _hsl_to_qcolor,
+)
 from slide_view import SlideGraphicsView
 from atlas_builder import AtlasBuilder, ClusterAtlas, SlideAtlasEntry
 from atlas_scatter_view import AtlasScatterView
@@ -2382,6 +2389,113 @@ class AtlasThumbnailPanel(QWidget):
                 item.widget().deleteLater()
 
 
+class PatchExemplarPopup(QDialog):
+    """Horizontally scrollable popup that renders exemplar patch cards."""
+
+    def __init__(
+        self,
+        popup_id: str,
+        source_label: str,
+        strategy: str,
+        parent: Optional[QWidget] = None,
+    ) -> None:
+        super().__init__(parent)
+        self.popup_id = popup_id
+        self.setWindowTitle(f"Patch Exemplars - {source_label}")
+        self.resize(1080, 360)
+        self._items: List[Dict[str, Any]] = []
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(10, 10, 10, 10)
+        root.setSpacing(8)
+
+        top = QHBoxLayout()
+        self._title = QLabel(f"{source_label} exemplars")
+        self._title.setStyleSheet("font-weight: 600; font-size: 12pt;")
+        self._meta = QLabel(f"Strategy: {strategy}")
+        self._meta.setStyleSheet("color: #666;")
+        self._export_btn = QPushButton("Export")
+        self._close_btn = QPushButton("Close")
+        top.addWidget(self._title)
+        top.addStretch(1)
+        top.addWidget(self._meta)
+        top.addWidget(self._export_btn)
+        top.addWidget(self._close_btn)
+        root.addLayout(top)
+
+        self._scroll = QScrollArea()
+        self._scroll.setWidgetResizable(True)
+        self._scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOn)
+        self._scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self._container = QWidget()
+        self._row = QHBoxLayout(self._container)
+        self._row.setContentsMargins(4, 4, 4, 4)
+        self._row.setSpacing(10)
+        self._scroll.setWidget(self._container)
+        root.addWidget(self._scroll, stretch=1)
+
+        self._close_btn.clicked.connect(self.close)
+
+    def set_items(
+        self,
+        items: List[Dict[str, Any]],
+        include_metadata: bool = True,
+    ) -> None:
+        self._items = items
+        while self._row.count():
+            child = self._row.takeAt(0)
+            if child.widget():
+                child.widget().deleteLater()
+
+        for item in items:
+            card = QFrame()
+            card.setFrameShape(QFrame.StyledPanel)
+            card.setMinimumWidth(180)
+            card_layout = QVBoxLayout(card)
+            card_layout.setContentsMargins(6, 6, 6, 6)
+            card_layout.setSpacing(4)
+
+            img_label = QLabel()
+            img_label.setAlignment(Qt.AlignCenter)
+            pix = item.get("pixmap")
+            if isinstance(pix, QPixmap) and not pix.isNull():
+                img_label.setPixmap(pix)
+            else:
+                img_label.setText("Image unavailable")
+                img_label.setStyleSheet("color: #888;")
+                img_label.setMinimumSize(QSize(160, 160))
+            card_layout.addWidget(img_label)
+
+            if include_metadata:
+                idx = int(item.get("patch_index", -1))
+                cluster = item.get("cluster_id")
+                coords = item.get("coords_lv0", {})
+                score = item.get("score")
+                details = [
+                    f"Patch {idx}",
+                    f"Cluster: {cluster if cluster is not None else 'N/A'}",
+                    f"({coords.get('x', '?')}, {coords.get('y', '?')})",
+                ]
+                if score is not None:
+                    details.append(f"Score: {float(score):.3f}")
+                for line in details:
+                    lbl = QLabel(line)
+                    lbl.setStyleSheet("font-size: 9pt;")
+                    card_layout.addWidget(lbl)
+
+            self._row.addWidget(card)
+
+        self._row.addStretch(1)
+
+    def items(self) -> List[Dict[str, Any]]:
+        """Return currently displayed exemplar items."""
+        return self._items
+
+    def export_button(self) -> QPushButton:
+        """Expose export button for parent wiring."""
+        return self._export_btn
+
+
 class MainWindow(QMainWindow):
     """Main application window for FoundationDetector.
     
@@ -2469,6 +2583,9 @@ class MainWindow(QMainWindow):
         self.settings = QSettings("FoundationDetector", "FoundationDetector")
         self.normalize_features = self.settings.value("normalize_features", True, type=bool)
         self._root_dir: str = ""
+        self._active_exemplar_popup: Optional[PatchExemplarPopup] = None
+        self._active_exemplar_popup_id: Optional[str] = None
+        self._active_exemplar_source_label: str = ""
         self._chat_thread: Optional[QThread] = None
         self._chat_worker: Optional[ChatAgentWorker] = None
         # UI components
@@ -2494,6 +2611,12 @@ class MainWindow(QMainWindow):
         self._max_cluster_distances: Optional[np.ndarray] = None
         self._current_labels: Optional[np.ndarray] = None
         self._current_colours: Optional[List[str]] = None
+        # Region embedding state
+        self._current_regions: Optional[List[RegionInfo]] = None
+        self._current_region_embedding: Optional[np.ndarray] = None
+        self._patches_per_region: int = self.settings.value("patches_per_region", 15, type=int)
+        # Saved patch opacities while a region X marker is being hovered
+        self._region_hover_saved_opacities: Dict[int, float] = {}
         # Persisted model selection for session
         self._model_selection: Optional[ModelSelection] = None
         # Track cascade animation state to prevent hover interference
@@ -2506,6 +2629,12 @@ class MainWindow(QMainWindow):
         self._local_region_radius: float = 50.0
         self._update_model_selection_label()
         self._set_model_dependent_ui_enabled(False)
+
+        # GUI action queue drain timer — MCP tools post actions here
+        self._gui_action_timer = QTimer(self)
+        self._gui_action_timer.setInterval(50)
+        self._gui_action_timer.timeout.connect(self._drain_gui_action_queue)
+        self._gui_action_timer.start()
 
     @property
     def _local_region_clusters(self) -> Dict[int, "LabeledRegion"]:
@@ -2767,6 +2896,30 @@ class MainWindow(QMainWindow):
         self.atlas_scatter_dock_action.setText("Show Atlas Embedding View")
         self.atlas_scatter_dock_action.setShortcut("Ctrl+4")
         self._view_menu.addAction(self.atlas_scatter_dock_action)
+
+        # Region Embedding View dock
+        self.region_scatter_view = RegionScatterView()
+        self.region_scatter_view.setMinimumSize(250, 250)
+        self.region_scatter_view.region_clicked.connect(self._on_region_scatter_clicked)
+        self.region_scatter_view.region_hovered.connect(self._on_region_scatter_hovered)
+
+        self.region_scatter_dock = QDockWidget("Region Embedding View", self)
+        self.region_scatter_dock.setWidget(self.region_scatter_view)
+        self.region_scatter_dock.setAllowedAreas(Qt.AllDockWidgetAreas)
+        self.region_scatter_dock.setFeatures(
+            QDockWidget.DockWidgetMovable |
+            QDockWidget.DockWidgetFloatable |
+            QDockWidget.DockWidgetClosable
+        )
+        self.addDockWidget(Qt.RightDockWidgetArea, self.region_scatter_dock)
+        self.region_scatter_dock.setFloating(True)
+        self.region_scatter_dock.resize(350, 350)
+        self.region_scatter_dock.hide()
+
+        self.region_scatter_dock_action = self.region_scatter_dock.toggleViewAction()
+        self.region_scatter_dock_action.setText("Show Region Embedding View")
+        self.region_scatter_dock_action.setShortcut("Ctrl+6")
+        self._view_menu.addAction(self.region_scatter_dock_action)
 
         # Agent chat view in separate dock widget
         self.chat_dock = ChatDockWidget(self)
@@ -3119,6 +3272,45 @@ class MainWindow(QMainWindow):
         self.scatter_view.labels = None
         self.scatter_view.cluster_colors = []
         self.scatter_view.set_animation_active(False)
+        self.region_scatter_view.clear()
+        self._current_regions = None
+        self._current_region_embedding = None
+
+    def _compute_and_populate_region_view(
+        self,
+        features: np.ndarray,
+        coords_thumb: np.ndarray,
+        labels: np.ndarray,
+        colours: List[str],
+    ) -> None:
+        """Compute spatial subclusters and populate the region embedding view."""
+        m = self._patches_per_region
+        try:
+            regions = compute_spatial_subclusters(features, coords_thumb, labels, colours, m)
+        except Exception as e:
+            print(f"DEBUG: compute_spatial_subclusters failed: {e}")
+            self.region_scatter_view.clear()
+            self._current_regions = None
+            return
+
+        if len(regions) < 2:
+            self.region_scatter_view.clear()
+            self._current_regions = None
+            return
+
+        coords_2d, _ = compute_region_pca_embedding(regions, features)
+        if coords_2d is None:
+            self.region_scatter_view.clear()
+            self._current_regions = None
+            return
+
+        self._current_regions = regions
+        self._current_region_embedding = coords_2d
+        cluster_colors_q = [
+            _hsl_to_qcolor(c) if isinstance(c, str) else c for c in colours
+        ]
+        self.region_scatter_view.populate(coords_2d, regions, cluster_colors_q)
+        print(f"DEBUG: Region view populated with {len(regions)} regions (M={m})")
 
     def _show_toast(self, message: str) -> None:
         """Show a short-lived floating toast message near the cursor."""
@@ -4395,6 +4587,9 @@ class MainWindow(QMainWindow):
             
             # Populate scatter plot using new view
             self.scatter_view.populate(self._current_embedding, labels, colours)
+            self._compute_and_populate_region_view(
+                self._current_features, self._current_coords_thumb, labels, colours
+            )
             print("DEBUG: Data loading complete; views updated")
             # If atlas is active for this slide, apply atlas labels/colors over local ones
             if self._is_atlas_active():
@@ -4428,6 +4623,9 @@ class MainWindow(QMainWindow):
             # Update both views with new labels and colours
             self.graphics_view.update_labels_and_colours(labels, colours)
             self.scatter_view.populate(self._current_embedding, labels, colours)
+            self._compute_and_populate_region_view(
+                self._current_features, self._current_coords_thumb, labels, colours
+            )
             # If atlas is active for this slide, re-apply atlas overlay
             if self._is_atlas_active():
                 self._apply_atlas_to_views()
@@ -4525,6 +4723,499 @@ class MainWindow(QMainWindow):
             labeled_regions=region_data,
             selected_clusters=set(self._selected_clusters),
         )
+        # Push region catalog to chat dock for @ mention autocomplete
+        self.chat_dock.update_region_catalog([
+            {"name": r.name, "region_id": rid}
+            for rid, r in self._labeled_regions.items()
+        ])
+
+    # -------------------------------------------------------------------------
+    # GUI action queue — called by MCP tools from background thread
+    # -------------------------------------------------------------------------
+
+    def _drain_gui_action_queue(self) -> None:
+        """Consume pending GUI actions posted by MCP tools (main-thread QTimer)."""
+        for action in app_state.drain_gui_actions():
+            action_id = action["action_id"]
+            try:
+                result = self._handle_gui_action(action["action_type"], action["params"])
+            except Exception as exc:
+                result = {"error": str(exc)}
+            app_state.set_gui_action_result(action_id, result)
+
+    def _handle_gui_action(self, action_type: str, params: Dict[str, Any]) -> Dict[str, Any]:
+        """Dispatch a GUI action to the appropriate handler."""
+        if action_type == "label_cluster":
+            return self._gui_action_label_cluster(params)
+        if action_type == "create_agent_region":
+            return self._gui_action_create_agent_region(params)
+        if action_type == "delete_region":
+            return self._gui_action_delete_region(params)
+        if action_type == "rename_region":
+            return self._gui_action_rename_region(params)
+        if action_type == "navigate_to_region":
+            return self._gui_action_navigate_to_region(params)
+        if action_type == "select_cluster":
+            return self._gui_action_select_cluster(params)
+        if action_type == "clear_all_regions":
+            self._clear_all_labeled_regions()
+            return {"success": True}
+        if action_type == "deselect_all_clusters":
+            return self._gui_action_deselect_all_clusters()
+        if action_type == "switch_to_atlas_view":
+            return self._gui_action_switch_to_atlas_view(params)
+        if action_type == "highlight_atlas_cluster":
+            return self._gui_action_highlight_atlas_cluster(params)
+        if action_type == "set_cluster_count":
+            return self._gui_action_set_cluster_count(params)
+        if action_type == "load_slide":
+            return self._gui_action_load_slide(params)
+        if action_type == "export_regions_geojson":
+            return self._gui_action_export_regions_geojson(params)
+        if action_type == "open_patch_exemplar_popup":
+            return self._gui_action_open_patch_exemplar_popup(params)
+        if action_type == "export_current_exemplar_popup":
+            return self._gui_action_export_current_exemplar_popup(params)
+        if action_type == "close_exemplar_popup":
+            return self._gui_action_close_exemplar_popup(params)
+        return {"error": f"Unknown action_type: {action_type!r}"}
+
+    def _gui_action_label_cluster(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        cluster_id = int(params["cluster_id"])
+        name = params.get("name")
+        if self._animation_in_progress:
+            return {"success": False, "reason": "animation_in_progress"}
+        created = self._create_kmeans_labeled_region(cluster_id)
+        if not created:
+            for rid, r in self._labeled_regions.items():
+                if r.source_mode == SourceMode.KMEANS and r.kmeans_cluster == cluster_id:
+                    return {"success": False, "reason": "already_labeled", "region_id": rid}
+            return {"success": False, "reason": "cluster_empty_or_unknown"}
+        region_id = None
+        for rid, r in self._labeled_regions.items():
+            if r.source_mode == SourceMode.KMEANS and r.kmeans_cluster == cluster_id:
+                region_id = rid
+                if name:
+                    r.name = name
+                break
+        if name and region_id is not None:
+            self.labeled_regions_widget.update_region(
+                region_id, len(self._labeled_regions[region_id].patch_indices), name
+            )
+            self._sync_app_state_regions()
+        self._prepare_scatter_for_cascade(cluster_id)
+        self._start_slide_cascade(cluster_id, self._get_cluster_screen_center(cluster_id))
+        return {
+            "success": True,
+            "region_id": region_id,
+            "patch_count": len(self._labeled_regions[region_id].patch_indices) if region_id is not None else 0,
+        }
+
+    def _gui_action_create_agent_region(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        patch_indices: Set[int] = set(int(i) for i in params["patch_indices"])
+        name = params.get("name")
+        if not patch_indices or self._current_labels is None:
+            return {"error": "No patches or no slide loaded"}
+        labels_subset = self._current_labels[sorted(patch_indices)]
+        counts = np.bincount(labels_subset.astype(int))
+        kmeans_cluster = int(counts.argmax())
+        region_id = self._next_region_id
+        self._next_region_id += 1
+        auto_name = name or f"Agent Region {region_id}"
+        color = (
+            QColor(self._current_colours[kmeans_cluster])
+            if self._current_colours and kmeans_cluster < len(self._current_colours)
+            else QColor("#888888")
+        )
+        region = LabeledRegion(
+            region_id=region_id,
+            name=auto_name,
+            color=color,
+            patch_indices=patch_indices,
+            source_mode=SourceMode.LOCAL,
+            kmeans_cluster=kmeans_cluster,
+            slide_name=self.slide_combo.currentText() or None,
+        )
+        self._labeled_regions[region_id] = region
+        self.labeled_regions_widget.add_region(region)
+        self._selected_clusters.add(kmeans_cluster)
+        self._apply_all_labeled_region_styles()
+        self._update_labeled_export_action()
+        self._sync_app_state_regions()
+        return {
+            "success": True,
+            "region_id": region_id,
+            "name": auto_name,
+            "patch_count": len(patch_indices),
+            "kmeans_cluster": kmeans_cluster,
+        }
+
+    def _gui_action_delete_region(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        region_id = int(params["region_id"])
+        if region_id not in self._labeled_regions:
+            return {"error": f"Region {region_id} not found"}
+        region = self._labeled_regions.pop(region_id)
+        self.labeled_regions_widget.remove_region(region_id)
+        if region.source_mode == SourceMode.KMEANS:
+            self._selected_clusters.discard(region.kmeans_cluster)
+        self._apply_all_labeled_region_styles()
+        self._update_labeled_export_action()
+        self._sync_app_state_regions()
+        return {"success": True, "deleted_region_id": region_id}
+
+    def _gui_action_rename_region(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        region_id = int(params["region_id"])
+        new_name = str(params["new_name"])
+        if region_id not in self._labeled_regions:
+            return {"error": f"Region {region_id} not found"}
+        old_name = self._labeled_regions[region_id].name
+        self._labeled_regions[region_id].name = new_name
+        self.labeled_regions_widget.update_region(
+            region_id, len(self._labeled_regions[region_id].patch_indices), new_name
+        )
+        self._sync_app_state_regions()
+        return {"success": True, "region_id": region_id, "old_name": old_name, "new_name": new_name}
+
+    def _gui_action_navigate_to_region(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        region_id = int(params["region_id"])
+        padding = float(params.get("padding_fraction", 0.15))
+        if region_id not in self._labeled_regions:
+            return {"error": f"Region {region_id} not found"}
+        region = self._labeled_regions[region_id]
+        if not region.patch_indices or self._current_coords_lv0 is None:
+            return {"error": "No coordinates available"}
+        idx = list(region.patch_indices)
+        if self.graphics_view.adaptive_mode and self._current_coords_lv0 is not None:
+            coords = self._current_coords_lv0[idx]
+        else:
+            coords = self.graphics_view.coords[idx]
+        pad_sz = float(self.graphics_view.patch_size or 0)
+        x_min = float(coords[:, 0].min())
+        y_min = float(coords[:, 1].min())
+        x_max = float(coords[:, 0].max()) + pad_sz
+        y_max = float(coords[:, 1].max()) + pad_sz
+        w, h = x_max - x_min, y_max - y_min
+        margin_x, margin_y = w * padding, h * padding
+        rect = QRectF(x_min - margin_x, y_min - margin_y, w + 2 * margin_x, h + 2 * margin_y)
+        self.graphics_view.fitInView(rect, Qt.AspectRatioMode.KeepAspectRatio)
+        return {
+            "success": True,
+            "region_id": region_id,
+            "bbox": {"x_min": x_min, "y_min": y_min, "x_max": x_max, "y_max": y_max},
+        }
+
+    def _gui_action_select_cluster(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        cluster_id = int(params["cluster_id"])
+        if self._current_labels is None:
+            return {"error": "No slide loaded"}
+        center = self._get_cluster_screen_center(cluster_id)
+        self._update_scatter_for_cluster(cluster_id, center, ctrl_pressed=False)
+        return {"success": True, "cluster_id": cluster_id}
+
+    def _gui_action_deselect_all_clusters(self) -> Dict[str, Any]:
+        self._selected_clusters.clear()
+        self._apply_selected_cluster_styles()
+        self._sync_app_state_regions()
+        return {"success": True}
+
+    def _gui_action_switch_to_atlas_view(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        del params
+        if self._cluster_atlas is None:
+            return {"error": "No atlas has been built yet"}
+        self.sidebar_tabs.setCurrentIndex(1)
+        return {"success": True}
+
+    def _gui_action_highlight_atlas_cluster(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        cluster_id = int(params["cluster_id"])
+        if self._cluster_atlas is None:
+            return {"error": "No atlas has been built yet"}
+        self.atlas_thumbnail_panel.highlight_cluster(cluster_id, self._selected_clusters)
+        if hasattr(self, "atlas_scatter_view") and self.atlas_scatter_view is not None:
+            self.atlas_scatter_view.highlight_cluster(cluster_id)
+        return {"success": True, "cluster_id": cluster_id}
+
+    def _gui_action_set_cluster_count(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        k = int(params["k"])
+        if k < self.cluster_spin.minimum() or k > self.cluster_spin.maximum():
+            return {"error": f"k must be between {self.cluster_spin.minimum()} and {self.cluster_spin.maximum()}"}
+        if self._model_selection is None:
+            return {"error": "No model selection active — load a slide with a model first"}
+        old_k = self.cluster_spin.value()
+        self.cluster_spin.setValue(k)
+        # If the value didn't actually change, the signal won't fire,
+        # so trigger reclustering manually in that case.
+        if old_k == k:
+            self._load_current_data(recluster_only=True)
+        return {"success": True, "previous_k": old_k, "new_k": k}
+
+    def _gui_action_load_slide(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        slide_name = str(params["slide_name"])
+        if not self.slides:
+            return {"error": "No slides loaded — open a directory first"}
+        if slide_name not in self.slides:
+            available = sorted(self.slides.keys())
+            return {"error": f"Slide '{slide_name}' not found. Available: {available}"}
+        previous = self.slide_combo.currentText()
+        self.slide_combo.setCurrentText(slide_name)
+        return {"success": True, "previous_slide": previous, "loaded_slide": slide_name}
+
+    def _gui_action_export_regions_geojson(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        if not self._labeled_regions:
+            return {"error": "No labeled regions to export"}
+        output_path = params.get("output_path")
+        if not output_path:
+            slide_name = self.slide_combo.currentText() or "regions"
+            base = os.path.splitext(slide_name)[0]
+            output_path = os.path.join(self._root_dir or ".", f"{base}_regions.geojson")
+
+        if self._current_coords_lv0 is not None:
+            coords = self._current_coords_lv0
+            patch_size = self._current_patch_size_lv0
+        else:
+            coords = self.graphics_view.coords
+            patch_size = self.graphics_view.patch_size
+
+        if coords is None:
+            return {"error": "No coordinate data available"}
+
+        features = []
+        for region in self._labeled_regions.values():
+            boxes = []
+            for idx in region.patch_indices:
+                if 0 <= idx < len(coords):
+                    x, y = coords[idx]
+                    boxes.append(box(x, y, x + patch_size, y + patch_size))
+            if boxes:
+                merged = unary_union(boxes)
+                color_hex = region.color.name()
+                feature = {
+                    "type": "Feature",
+                    "geometry": merged.__geo_interface__,
+                    "properties": {
+                        "classification": {
+                            "name": region.name,
+                            "colorRGB": int(color_hex.replace('#', ''), 16),
+                        },
+                        "region_id": region.region_id,
+                        "patch_count": len(region.patch_indices),
+                        "kmeans_cluster": region.kmeans_cluster,
+                        "source_mode": region.source_mode.value,
+                    },
+                }
+                features.append(feature)
+
+        geojson = {"type": "FeatureCollection", "features": features}
+        with open(output_path, "w") as f:
+            json.dump(geojson, f, indent=2)
+
+        return {"success": True, "file_path": output_path, "region_count": len(features)}
+
+    def _gui_action_open_patch_exemplar_popup(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        popup_id = str(params.get("popup_id") or f"exemplar-{uuid.uuid4()}")
+        patch_indices = [int(i) for i in params.get("patch_indices", [])]
+        include_metadata = bool(params.get("include_metadata", True))
+        source_label = str(params.get("source_label") or "Exemplars")
+        strategy = str(params.get("strategy") or "diverse")
+        scores_by_patch = params.get("scores_by_patch", {}) or {}
+
+        if not patch_indices:
+            return {"error": "No patch indices provided"}
+        if self._current_coords_lv0 is None or self._current_patch_size_lv0 is None:
+            return {"error": "Level-0 coordinates are unavailable for exemplar rendering"}
+
+        slide_path = self._current_slide_image_path()
+        if not slide_path:
+            return {"error": "Could not resolve current slide image path"}
+
+        patch_size = int(max(1, round(float(self._current_patch_size_lv0))))
+        target_size = 160
+        exemplar_items: List[Dict[str, Any]] = []
+        image_failures = 0
+
+        backend = None
+        backend_type = ""
+        try:
+            if data_loader.openslide is not None:
+                backend = data_loader.openslide.OpenSlide(slide_path)  # type: ignore[attr-defined]
+                backend_type = "openslide"
+            else:
+                backend = Image.open(slide_path)
+                backend_type = "pil"
+        except Exception as exc:
+            return {"error": f"Failed to open slide image backend: {exc}"}
+
+        for idx in patch_indices:
+            pixmap = QPixmap()
+            if idx < 0 or idx >= len(self._current_coords_lv0):
+                image_failures += 1
+                continue
+            coords = self._current_coords_lv0[idx]
+            x = int(coords[0])
+            y = int(coords[1])
+            try:
+                if backend_type == "openslide":
+                    tile = backend.read_region((x, y), 0, (patch_size, patch_size)).convert("RGB")
+                else:
+                    tile = backend.crop((x, y, x + patch_size, y + patch_size)).convert("RGB")
+                if tile.size != (target_size, target_size):
+                    tile = tile.resize((target_size, target_size), Image.BILINEAR)
+                pixmap = QPixmap.fromImage(QImage(ImageQt(tile)))
+            except Exception:
+                image_failures += 1
+                pixmap = QPixmap(target_size, target_size)
+                pixmap.fill(QColor("#303030"))
+
+            cluster_id = None
+            if self._current_labels is not None and 0 <= idx < len(self._current_labels):
+                cluster_id = int(self._current_labels[idx])
+            exemplar_items.append(
+                {
+                    "patch_index": int(idx),
+                    "cluster_id": cluster_id,
+                    "coords_lv0": {"x": x, "y": y},
+                    "score": float(scores_by_patch.get(str(idx), scores_by_patch.get(idx, 0.0))),
+                    "pixmap": pixmap,
+                }
+            )
+
+        if backend is not None:
+            try:
+                backend.close()
+            except Exception:
+                pass
+
+        if self._active_exemplar_popup is not None:
+            self._active_exemplar_popup.close()
+            self._active_exemplar_popup.deleteLater()
+
+        popup = PatchExemplarPopup(
+            popup_id=popup_id,
+            source_label=source_label,
+            strategy=strategy,
+            parent=self,
+        )
+        popup.set_items(exemplar_items, include_metadata=include_metadata)
+        popup.export_button().clicked.connect(
+            lambda: self._gui_action_export_current_exemplar_popup({"popup_id": popup_id})
+        )
+        popup.finished.connect(lambda _result, pid=popup_id: self._on_exemplar_popup_closed(pid))
+        popup.show()
+        popup.raise_()
+
+        self._active_exemplar_popup = popup
+        self._active_exemplar_popup_id = popup_id
+        self._active_exemplar_source_label = source_label
+
+        warnings: List[str] = []
+        if image_failures:
+            warnings.append(f"{image_failures} exemplar patches used fallback placeholders")
+        return {
+            "success": True,
+            "popup_id": popup_id,
+            "shown_count": len(exemplar_items),
+            "sample_indices": [int(item["patch_index"]) for item in exemplar_items],
+            "warnings": warnings,
+        }
+
+    def _gui_action_export_current_exemplar_popup(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        popup_id = str(params.get("popup_id") or "")
+        if self._active_exemplar_popup is None or self._active_exemplar_popup_id != popup_id:
+            return {"error": f"No active exemplar popup for popup_id='{popup_id}'"}
+
+        requested_dir = params.get("output_dir")
+        if requested_dir:
+            output_dir = os.path.abspath(os.path.expanduser(str(requested_dir)))
+        else:
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            output_dir = os.path.join(
+                self._root_dir or ".",
+                "Reports",
+                f"exemplars_{(self.slide_combo.currentText() or 'slide')}_{ts}",
+            )
+        os.makedirs(output_dir, exist_ok=True)
+
+        image_paths: List[str] = []
+        manifest_items: List[Dict[str, Any]] = []
+        for item in self._active_exemplar_popup.items():
+            idx = int(item.get("patch_index", -1))
+            if idx < 0:
+                continue
+            path = os.path.join(output_dir, f"patch_{idx}.png")
+            pix = item.get("pixmap")
+            if isinstance(pix, QPixmap) and not pix.isNull():
+                pix.save(path, "PNG")
+                image_paths.append(path)
+                manifest_items.append(
+                    {
+                        "patch_index": idx,
+                        "cluster_id": item.get("cluster_id"),
+                        "coords_lv0": item.get("coords_lv0"),
+                        "score": item.get("score"),
+                        "image_path": path,
+                    }
+                )
+
+        manifest_path = None
+        if bool(params.get("include_manifest", True)):
+            manifest_path = os.path.join(output_dir, "manifest.json")
+            payload = {
+                "popup_id": popup_id,
+                "slide_name": self.slide_combo.currentText(),
+                "source_label": self._active_exemplar_source_label,
+                "items": manifest_items,
+            }
+            with open(manifest_path, "w", encoding="utf-8") as f:
+                json.dump(payload, f, indent=2)
+
+        return {
+            "success": True,
+            "popup_id": popup_id,
+            "output_dir": output_dir,
+            "files": image_paths,
+            "manifest_path": manifest_path,
+            "count": len(image_paths),
+        }
+
+    def _gui_action_close_exemplar_popup(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        popup_id = str(params.get("popup_id") or "")
+        if self._active_exemplar_popup is None:
+            return {"success": True, "closed": False}
+        if popup_id and self._active_exemplar_popup_id != popup_id:
+            return {"success": True, "closed": False, "reason": "popup_id_mismatch"}
+        self._active_exemplar_popup.close()
+        self._active_exemplar_popup.deleteLater()
+        self._active_exemplar_popup = None
+        self._active_exemplar_popup_id = None
+        self._active_exemplar_source_label = ""
+        return {"success": True, "closed": True}
+
+    def _current_slide_image_path(self) -> Optional[str]:
+        """Return the current slide image path if available."""
+        slide_name = self.slide_combo.currentText()
+        if not slide_name:
+            return None
+        info = self.slides.get(slide_name)
+        if info is None:
+            return None
+        return info.image_path
+
+    def _on_exemplar_popup_closed(self, popup_id: str) -> None:
+        """Clear popup state when the exemplar dialog closes."""
+        if self._active_exemplar_popup_id != popup_id:
+            return
+        self._active_exemplar_popup = None
+        self._active_exemplar_popup_id = None
+        self._active_exemplar_source_label = ""
+
+    def _get_cluster_screen_center(self, cluster_id: int) -> Tuple[float, float]:
+        """Return the mean scene position of all patches in a cluster."""
+        if self._current_labels is None or self.graphics_view.coords is None:
+            return (0.0, 0.0)
+        mask = self._current_labels == cluster_id
+        coords = self.graphics_view.coords[mask]
+        if len(coords) == 0:
+            return (0.0, 0.0)
+        return (float(coords[:, 0].mean()), float(coords[:, 1].mean()))
 
     def _get_distance_to_centroid(self, index: int) -> Optional[float]:
         """Get normalized distance from a patch to its cluster centroid.
@@ -4870,6 +5561,30 @@ class MainWindow(QMainWindow):
             )
             return
 
+        at_regions = (metadata or {}).get("at_regions", [])
+        at_unresolved = (metadata or {}).get("at_unresolved", [])
+
+        # Warn about any unresolved @mentions
+        if at_unresolved:
+            self.chat_dock.add_error(
+                "Unresolved @mention",
+                f"No labeled region named: {', '.join('@' + n for n in at_unresolved)}",
+            )
+
+        # Inject region context inline so the agent knows region_id → tool mapping
+        if at_regions:
+            context_parts = []
+            for entry in at_regions:
+                rid = entry["region_id"]
+                r = self._labeled_regions.get(rid)
+                if r:
+                    context_parts.append(
+                        f"@{r.name} = region_id={rid} "
+                        f"({len(r.patch_indices)} patches, {r.source_mode.name.lower()})"
+                    )
+            if context_parts:
+                text = "[Region context: " + "; ".join(context_parts) + "]\n" + text
+
         context = {
             "root_dir": self._root_dir,
             "has_slide_loaded": getattr(self, "_current_features", None) is not None,
@@ -4947,6 +5662,40 @@ class MainWindow(QMainWindow):
         elif state == "idle":
             self.chat_dock.stop_typing_indicator()
 
+    def _on_region_scatter_clicked(self, region_index: int) -> None:
+        """Handle click on a region X marker — creates a local region annotation."""
+        if not self._current_regions or region_index >= len(self._current_regions):
+            return
+        region = self._current_regions[region_index]
+        patch_set = set(region.patch_indices)
+        center = self._compute_local_region_center(patch_set)
+        self._create_local_region_cluster(patch_set, center, 0.0, region.kmeans_cluster)
+
+    def _on_region_scatter_hovered(self, region_index: int, state: bool) -> None:
+        """Handle hover on a region X marker — highlights patches in the slide view."""
+        if not self._current_regions or region_index >= len(self._current_regions):
+            return
+        region = self._current_regions[region_index]
+        if not self.graphics_view.rect_items:
+            return
+        n_rects = len(self.graphics_view.rect_items)
+        if state:
+            # Save current opacity for each patch then highlight
+            for idx in region.patch_indices:
+                if 0 <= idx < n_rects:
+                    rect = self.graphics_view.rect_items[idx]
+                    self._region_hover_saved_opacities[idx] = rect.opacity()
+                    rect.setOpacity(1.0)
+        else:
+            # Restore saved opacities
+            for idx in region.patch_indices:
+                if 0 <= idx < n_rects:
+                    rect = self.graphics_view.rect_items[idx]
+                    saved = self._region_hover_saved_opacities.pop(idx, rect.opacity())
+                    rect.setOpacity(saved)
+            # Ensure no stale entries remain if regions changed mid-hover
+            self._region_hover_saved_opacities.clear()
+
     def _show_preferences(self) -> None:
         """Display preferences dialog."""
         from preferences_dialog import PreferencesDialog
@@ -4955,6 +5704,17 @@ class MainWindow(QMainWindow):
             # Reload preferences after dialog closes
             self.normalize_features = self.settings.value("normalize_features", True, type=bool)
             self._setup_chat_agent()
+            # Reload M and recompute region view if data is loaded
+            new_m = self.settings.value("patches_per_region", 15, type=int)
+            if new_m != self._patches_per_region:
+                self._patches_per_region = new_m
+                if (self._current_features is not None
+                        and self._current_labels is not None
+                        and self._current_colours is not None):
+                    self._compute_and_populate_region_view(
+                        self._current_features, self._current_coords_thumb,
+                        self._current_labels, self._current_colours,
+                    )
     
     def _show_about(self) -> None:
         """Display About dialog with version and attribution."""
@@ -5043,6 +5803,11 @@ class MainWindow(QMainWindow):
         """Handle application close event and clean up resources."""
         print("DEBUG: Application closing, cleaning up resources")
         self._teardown_chat_agent()
+        if self._active_exemplar_popup is not None:
+            self._active_exemplar_popup.close()
+            self._active_exemplar_popup.deleteLater()
+            self._active_exemplar_popup = None
+            self._active_exemplar_popup_id = None
         # Clean up tile manager in graphics view
         if hasattr(self, 'graphics_view'):
             self.graphics_view.cleanup()
