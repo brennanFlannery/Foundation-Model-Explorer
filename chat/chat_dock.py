@@ -59,6 +59,54 @@ class TypingDotsWidget(QWidget):
             painter.drawEllipse(x - radius, y - radius, radius * 2, radius * 2)
 
 
+class ToolCallRow(QWidget):
+    """Minimal collapsible row for a single tool invocation."""
+
+    def __init__(self, tool_name: str, summary_text: str, raw_text: str, parent=None):
+        super().__init__(parent)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(8, 2, 8, 2)
+        layout.setSpacing(0)
+
+        header = QHBoxLayout()
+        self._toggle = QPushButton(f"\u25b8  used {tool_name}")
+        self._toggle.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._toggle.setStyleSheet(
+            "QPushButton { background: transparent; border: none; "
+            "text-align: left; color: #94a3b8; font-size: 9pt; padding: 2px 0; }"
+            "QPushButton:hover { color: #475569; }"
+        )
+        self._toggle.clicked.connect(self._toggle_details)
+        header.addWidget(self._toggle)
+        header.addStretch(1)
+        layout.addLayout(header)
+
+        self._details = QTextEdit()
+        self._details.setReadOnly(True)
+        self._details.setPlainText(summary_text + "\n\n--- raw ---\n" + raw_text)
+        self._details.setVisible(False)
+        self._details.setMaximumHeight(170)
+        self._details.setStyleSheet(
+            "QTextEdit { background: #f8fafc; border: 1px solid #e2e8f0; "
+            "border-radius: 6px; padding: 4px; "
+            "font-family: Menlo, Monaco, 'Courier New', monospace; font-size: 11px; }"
+        )
+        layout.addWidget(self._details)
+
+    def _toggle_details(self) -> None:
+        show = not self._details.isVisible()
+        self._details.setVisible(show)
+        text = self._toggle.text()
+        if show:
+            self._toggle.setText(text.replace("\u25b8", "\u25be"))
+        else:
+            self._toggle.setText(text.replace("\u25be", "\u25b8"))
+        self.updateGeometry()
+
+    def set_max_width(self, width: int) -> None:
+        self._details.setMaximumWidth(width - 16)
+
+
 class ChatBubbleRow(QWidget):
     """Single chat row with role-based bubble alignment and styling."""
 
@@ -252,7 +300,7 @@ class ChatDockWidget(QDockWidget):
 
         self._active_assistant_row: Optional[ChatBubbleRow] = None
         self._typing_row: Optional[ChatBubbleRow] = None
-        self._rows: List[ChatBubbleRow] = []
+        self._rows: List[QWidget] = []
         self._user_message_count: int = 0
         self._assistant_message_count: int = 0
         self._session_total_tokens: int = 0
@@ -803,7 +851,7 @@ class ChatDockWidget(QDockWidget):
         self._at_list.setCurrentItem(item)
         self._commit_at_selection()
 
-    def _remove_row(self, row: ChatBubbleRow) -> None:
+    def _remove_row(self, row: QWidget) -> None:
         self.messages_layout.removeWidget(row)
         if row in self._rows:
             self._rows.remove(row)
@@ -854,8 +902,13 @@ class ChatDockWidget(QDockWidget):
     def add_tool_card(self, tool_name: str, summary: Dict[str, Any], raw: Dict[str, Any]) -> None:
         summary_text = json.dumps(summary, indent=2, default=str)
         raw_text = json.dumps(raw, indent=2, default=str)
-        text = f"Tool: {tool_name}\n{summary_text}"
-        self._add_row("tool", text, details_text=raw_text)
+        was_at_bottom = self._is_at_bottom()
+        row = ToolCallRow(tool_name, summary_text, raw_text, parent=self.messages_container)
+        self._rows.append(row)
+        self.messages_layout.addWidget(row)
+        self._update_row_widths()
+        if was_at_bottom:
+            QTimer.singleShot(0, self._scroll_to_bottom)
 
     def add_error(self, message: str, details: str = "") -> None:
         details_part = f"\nDetails: {details}" if details else ""

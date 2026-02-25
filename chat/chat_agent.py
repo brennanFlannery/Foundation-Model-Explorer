@@ -11,9 +11,9 @@ from typing import Any, Dict, List, Literal, Optional, Set
 
 from PySide6.QtCore import QObject, Signal, Slot
 
-from chat_models import ChatMessage, ChatSessionState
-from llm_adapter import LiteLLMClient
-from mcp_bridge import MCPBridge
+from .chat_models import ChatMessage, ChatSessionState
+from .llm_adapter import LiteLLMClient
+from .mcp_bridge import MCPBridge
 
 logger = logging.getLogger(__name__)
 
@@ -726,24 +726,20 @@ class ChatAgentWorker(QObject):
         request_id: str,
         messages: List[Dict[str, Any]],
     ) -> tuple[str, Dict[str, Any]]:
-        """Stream final model response and aggregate full text."""
+        """Fetch final model response and emit character-by-character deltas."""
         self.response_started.emit(request_id)
-        full_text: List[str] = []
-
-        for chunk in self._llm.stream_with_tools(
+        response = self._llm.complete_with_tools(
             messages=messages,
             tools=[],
             timeout_s=self._config.llm_timeout_s,
-        ):
+        )
+        final_text = self._extract_message_content(response)
+        for character in final_text:
             if self._cancel_requested:
                 break
-            delta = self._llm.extract_text_delta(chunk)
-            if not delta:
-                continue
-            full_text.append(delta)
-            self.response_delta.emit(request_id, delta)
-
-        return "".join(full_text), {}
+            self.response_delta.emit(request_id, character)
+        usage = self._llm.normalize_usage(response)
+        return final_text, usage
 
     @staticmethod
     def _build_assistant_tool_calls_message(

@@ -239,6 +239,7 @@ class ScatterGraphicsView(QGraphicsView):
         # Local region selection mode state
         self._local_region_mode: bool = False
         self._local_region_radius: float = 50.0
+        self._erase_mode: bool = False
 
     def _set_cursor(self, cursor) -> None:
         """Set cursor on viewport (correct for QAbstractScrollArea) and track it."""
@@ -420,6 +421,12 @@ class ScatterGraphicsView(QGraphicsView):
         else:
             self._set_cursor(Qt.CursorShape.CrossCursor)
 
+    def set_erase_mode(self, enabled: bool) -> None:
+        """Set erase mode; updates cursor color if local-region mode is active."""
+        self._erase_mode = enabled
+        if self._local_region_mode:
+            self._update_radius_cursor()
+
     def set_local_region_radius(self, radius: float) -> None:
         """Update the selection radius.
 
@@ -450,11 +457,17 @@ class ScatterGraphicsView(QGraphicsView):
         painter = QPainter(pixmap)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
 
-        # Draw circle outline
-        pen = QPen(QColor(255, 100, 100, 200))
+        # Draw circle outline (orange = erase mode, red = label mode)
+        if getattr(self, '_erase_mode', False):
+            outline_color = QColor(230, 130, 30, 220)
+            fill_color    = QColor(230, 130, 30, 40)
+        else:
+            outline_color = QColor(255, 100, 100, 200)
+            fill_color    = QColor(255, 100, 100, 30)
+        pen = QPen(outline_color)
         pen.setWidth(2)
         painter.setPen(pen)
-        painter.setBrush(QBrush(QColor(255, 100, 100, 30)))
+        painter.setBrush(QBrush(fill_color))
 
         margin = 2
         painter.drawEllipse(margin, margin,

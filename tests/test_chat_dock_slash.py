@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from chat_dock import ChatDockWidget
+from chat import ChatDockWidget
 
 
 def test_extract_slash_prefix_returns_prefix_while_typing_command():

@@ -33,7 +33,7 @@ from PySide6.QtWidgets import (
 )
 
 if TYPE_CHECKING:
-    from atlas_builder import ClusterAtlas
+    from .atlas_builder import ClusterAtlas
 
 
 class AtlasScatterItem(QObject, QGraphicsEllipseItem):

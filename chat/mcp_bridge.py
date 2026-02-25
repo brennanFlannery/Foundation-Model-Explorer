@@ -58,7 +58,7 @@ class MCPBridge:
                 "MCP SDK is not installed. Install `mcp` to enable local tools."
             ) from exc
 
-        from mcp_server import mcp as _mcp_app  # import here to avoid circular at module level
+        from .mcp_server import mcp as _mcp_app  # import here to avoid circular at module level
 
         self._stop_event = asyncio.Event()
         async with create_connected_server_and_client_session(_mcp_app) as client_session:

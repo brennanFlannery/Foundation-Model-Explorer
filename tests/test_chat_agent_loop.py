@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, List
 
-from chat_agent import ChatAgentConfig, ChatAgentWorker
+from chat import ChatAgentConfig, ChatAgentWorker
 
 
 class FakeLLM:

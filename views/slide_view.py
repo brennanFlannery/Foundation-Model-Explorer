@@ -61,11 +61,11 @@ import data_loader
 from utils import generate_palette, cluster_features, infer_slide_dims, radial_sweep_order
 from PySide6.QtCore import Signal
 
-from scatter_view import _hsl_to_qcolor
+from .scatter_view import _hsl_to_qcolor
 
 # Import tile manager for adaptive zoom
 try:
-    from tile_manager import TileManager
+    from .tile_manager import TileManager
     TILE_MANAGER_AVAILABLE = True
 except ImportError:
     TileManager = None
@@ -232,6 +232,7 @@ class SlideGraphicsView(QGraphicsView):
         # Local region selection mode state
         self._local_region_mode: bool = False
         self._local_region_radius: float = 50.0
+        self._erase_mode: bool = False
 
     def _set_cursor(self, cursor) -> None:
         """Track desired cursor and update override cursor if active."""
@@ -965,6 +966,12 @@ class SlideGraphicsView(QGraphicsView):
         else:
             self._set_cursor(Qt.CursorShape.CrossCursor)
 
+    def set_erase_mode(self, enabled: bool) -> None:
+        """Set erase mode; updates cursor color if local-region mode is active."""
+        self._erase_mode = enabled
+        if self._local_region_mode:
+            self._update_radius_cursor()
+
     def set_local_region_radius(self, radius: float) -> None:
         """Update the selection radius.
 
@@ -996,11 +1003,17 @@ class SlideGraphicsView(QGraphicsView):
         painter = QPainter(pixmap)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
 
-        # Draw circle outline
-        pen = QPen(QColor(255, 100, 100, 200))
+        # Draw circle outline (orange = erase mode, red = label mode)
+        if getattr(self, '_erase_mode', False):
+            outline_color = QColor(230, 130, 30, 220)
+            fill_color    = QColor(230, 130, 30, 40)
+        else:
+            outline_color = QColor(255, 100, 100, 200)
+            fill_color    = QColor(255, 100, 100, 30)
+        pen = QPen(outline_color)
         pen.setWidth(2)
         painter.setPen(pen)
-        painter.setBrush(QBrush(QColor(255, 100, 100, 30)))  # Semi-transparent fill
+        painter.setBrush(QBrush(fill_color))  # Semi-transparent fill
 
         margin = 2
         painter.drawEllipse(margin, margin,

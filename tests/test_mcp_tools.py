@@ -4,7 +4,7 @@ from pathlib import Path
 
 import h5py
 
-from mcp_server import inspect_h5, list_data
+from chat.mcp_server import inspect_h5, list_data
 
 
 def test_inspect_h5_returns_dataset_summary(tmp_path: Path):
