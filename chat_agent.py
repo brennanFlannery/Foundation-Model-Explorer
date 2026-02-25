@@ -125,6 +125,7 @@ TOOL_HINTS: Dict[str, str] = {
     "deselect_all_clusters": "clear cluster selection highlighting",
     "expand_region": "expand a labeled region outward by N grid rings of adjacent patches",
     "find_most_different_cluster": "find cluster most dissimilar to combined centroid of one or more regions",
+    "find_most_distinct_cluster": "rank clusters by distinctness without requiring pre-labeled regions",
     "switch_to_atlas_view": "switch GUI sidebar to the Atlas tab",
     "highlight_atlas_cluster": "highlight a cluster across all atlas thumbnails and scatter view",
     "set_cluster_count": "change K-means cluster count and re-cluster",
@@ -135,6 +136,9 @@ TOOL_HINTS: Dict[str, str] = {
     "export_current_exemplar_popup": "export images currently shown in exemplar popup",
     "close_exemplar_popup": "close the active exemplar popup",
     "generate_slide_qc_report": "create a markdown QC report plus JSON summary for a slide/model setup",
+    "generate_cross_slide_qc_report": "create a cross-slide QC report with atlas-style OOD ranking",
+    "detect_ood_patches": "score out-of-distribution patches using embedding-space k-NN distance",
+    "label_ood_patches_as_region": "create labeled region annotations from OOD patch indices",
 }
 
 
@@ -201,6 +205,7 @@ class ChatAgentWorker(QObject):
             "deselect_all_clusters",
             "expand_region",
             "find_most_different_cluster",
+            "find_most_distinct_cluster",
             "switch_to_atlas_view",
             "highlight_atlas_cluster",
             "set_cluster_count",
@@ -211,6 +216,9 @@ class ChatAgentWorker(QObject):
             "export_current_exemplar_popup",
             "close_exemplar_popup",
             "generate_slide_qc_report",
+            "generate_cross_slide_qc_report",
+            "detect_ood_patches",
+            "label_ood_patches_as_region",
         }
         self._cached_tools: Optional[List[Dict[str, Any]]] = None
         self._tool_stats: Dict[str, Dict[str, float]] = {}
@@ -549,6 +557,7 @@ class ChatAgentWorker(QObject):
             "rank_models_by_separability",
             "compute_elbow_analysis",
             "generate_slide_qc_report",
+            "generate_cross_slide_qc_report",
             "load_slide",
         }
 
@@ -577,6 +586,9 @@ class ChatAgentWorker(QObject):
                     "lookup_patch_by_coords",
                     "open_patch_exemplar_popup",
                     "close_exemplar_popup",
+                    "detect_ood_patches",
+                    "label_ood_patches_as_region",
+                    "find_most_distinct_cluster",
                 }
             )
 
@@ -888,6 +900,7 @@ class ChatAgentWorker(QObject):
                 "region_id": raw.get("region_id"),
                 "cluster_id": raw.get("cluster_id"),
                 "name": raw.get("name"),
+                "color_hex": raw.get("color_hex"),
                 "computed": raw["computed"],
                 "unknown_metrics": raw.get("unknown_metrics", []),
             }
@@ -957,6 +970,66 @@ class ChatAgentWorker(QObject):
                 "most_represented": raw.get("most_represented", []),
                 "single_slide_only": raw.get("single_slide_only", []),
                 "clusters": raw.get("clusters", []),
+            }
+
+        # detect_ood_patches
+        if "top_outliers" in raw and "outlier_count" in raw:
+            return {
+                "mode": raw.get("mode"),
+                "method": raw.get("method"),
+                "outlier_count": raw.get("outlier_count"),
+                "outlier_fraction": raw.get("outlier_fraction"),
+                "threshold_used": raw.get("threshold_used"),
+                "reference_slides": raw.get("reference_slides"),
+                "top_5_shown": [
+                    {
+                        "patch_index": p.get("patch_index"),
+                        "score": p.get("score"),
+                        "cluster_id": p.get("cluster_id"),
+                    }
+                    for p in (raw.get("top_outliers") or [])[:5]
+                ],
+                "warnings": raw.get("warnings") or [],
+            }
+
+        # label_ood_patches_as_region
+        if "created_regions" in raw and "grouping_mode" in raw:
+            return {
+                "grouping_mode": raw.get("grouping_mode"),
+                "component_count": raw.get("component_count"),
+                "dropped_components": raw.get("dropped_components"),
+                "total_input_patches": raw.get("total_input_patches"),
+                "total_labeled_patches": raw.get("total_labeled_patches"),
+                "exact_match": raw.get("exact_match"),
+                "created_regions": raw.get("created_regions"),
+            }
+
+        # find_most_distinct_cluster / find_most_different_cluster
+        if "ranked_clusters" in raw and "most_distinct_cluster_id" in raw:
+            return {
+                "metric": raw.get("metric"),
+                "most_distinct_cluster_id": raw.get("most_distinct_cluster_id"),
+                "top_ranked": (raw.get("ranked_clusters") or [])[:5],
+                "note": raw.get("note"),
+            }
+
+        # generate_cross_slide_qc_report
+        if "most_ood_slide" in raw and "summary_json_path" in raw and "scores" in raw:
+            return {
+                "report_path": raw.get("report_path"),
+                "summary_json_path": raw.get("summary_json_path"),
+                "most_ood_slide": raw.get("most_ood_slide"),
+                "scores": raw.get("scores"),
+                "warnings": raw.get("warnings") or [],
+            }
+
+        # generate_slide_qc_report
+        if "report_path" in raw and "scores" in raw:
+            return {
+                "report_path": raw.get("report_path"),
+                "summary_json_path": raw.get("summary_json_path"),
+                "scores": raw.get("scores"),
+                "warnings": raw.get("warnings") or [],
             }
 
         return {"keys": sorted(list(raw.keys()))[:20]}

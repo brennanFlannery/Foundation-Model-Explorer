@@ -949,6 +949,7 @@ class ClusterLegendWidget(QWidget):
             f"background-color: {hex_color}; "
             f"border: 1px solid #666; border-radius: 2px;"
         )
+        color_square.installEventFilter(self)
         layout.addWidget(color_square)
 
         # Checkbox for multi-select
@@ -963,6 +964,7 @@ class ClusterLegendWidget(QWidget):
         label = QLabel(display_name)
         label.setStyleSheet("font-size: 9pt;")
         label.setObjectName("cluster_label")  # For later reference when renaming
+        label.installEventFilter(self)
         layout.addWidget(label)
 
         # Spacer
@@ -971,6 +973,7 @@ class ClusterLegendWidget(QWidget):
         # Count
         count_label = QLabel(f"({count:,})")
         count_label.setStyleSheet("color: #888; font-size: 9pt;")
+        count_label.installEventFilter(self)
         layout.addWidget(count_label)
 
         return row
@@ -982,13 +985,15 @@ class ClusterLegendWidget(QWidget):
 
         if event.type() == QEvent.MouseButtonPress:
             cluster_id = obj.property("cluster_id")
+            if cluster_id is None and obj.parent() is not None:
+                cluster_id = obj.parent().property("cluster_id")
             if cluster_id is not None:
                 if event.button() == Qt.LeftButton:
                     ctrl_pressed = bool(event.modifiers() & Qt.ControlModifier)
                     self.cluster_clicked.emit(cluster_id, ctrl_pressed)
                     return True
                 elif event.button() == Qt.RightButton:
-                    self._show_context_menu(cluster_id, event.globalPos())
+                    self._show_context_menu(cluster_id, event.globalPosition().toPoint())
                     return True
         return super().eventFilter(obj, event)
 
@@ -1035,6 +1040,12 @@ class ClusterLegendWidget(QWidget):
             The new display name.
         """
         self._cluster_names[cluster_id] = name
+        for row in self._cluster_rows:
+            if row.property("cluster_id") == cluster_id:
+                label = row.findChild(QLabel, "cluster_label")
+                if label is not None:
+                    label.setText(name)
+                break
 
     def get_cluster_name(self, cluster_id: int) -> str:
         """Get the display name for a cluster.
@@ -2719,6 +2730,10 @@ class MainWindow(QMainWindow):
         local_layout.addStretch()
         self.sidebar_tabs.addTab(local_tab, "Local Region")
 
+        # Tab 1: Cluster Legend
+        self.cluster_legend = ClusterLegendWidget()
+        self.sidebar_tabs.addTab(self.cluster_legend, "Clusters")
+
         # Connect Local Region widget signals
         self.local_region_widget.radius_changed.connect(self._on_local_region_radius_changed)
         self.local_region_widget.region_clicked.connect(self._on_local_region_clicked)
@@ -3046,6 +3061,7 @@ class MainWindow(QMainWindow):
         self.mag_combo.currentTextChanged.connect(self._on_mag_changed)
         self.patch_combo.currentTextChanged.connect(self._on_patch_changed)
         self.cluster_spin.valueChanged.connect(self._on_cluster_changed)
+        self.cluster_legend.cluster_rename.connect(self._on_cluster_rename_requested)
 
     # ---- Handlers ----
 
@@ -3649,6 +3665,17 @@ class MainWindow(QMainWindow):
         idx0 = cluster_indices[0]
         x, y = self.graphics_view.coords[idx0] + self.graphics_view.patch_size / 2.0
         self._start_slide_cascade(cluster, (x, y))
+
+    def _on_cluster_rename_requested(self, cluster_id: int) -> None:
+        """Prompt the user to rename a cluster."""
+        current_name = self.cluster_legend.get_cluster_name(cluster_id)
+        name, ok = QInputDialog.getText(
+            self, "Rename Cluster",
+            f"New name for cluster {cluster_id}:",
+            text=current_name
+        )
+        if ok and name.strip():
+            self.cluster_legend.set_cluster_name(cluster_id, name.strip())
 
     def _on_export_all_clusters(self) -> None:
         """Export all clusters to a single GeoJSON file."""
@@ -4549,7 +4576,9 @@ class MainWindow(QMainWindow):
             self._cluster_centroids = self._compute_centroids(features, labels)
             self._current_labels = labels
             self._current_colours = colours
-            
+            self.cluster_legend.clear_cluster_names()
+            self.cluster_legend.update_clusters(labels, colours)
+
             # Determine whether to use adaptive or thumbnail mode
             use_adaptive = (
                 self.adaptive_zoom_action.isChecked() and 
@@ -4619,6 +4648,8 @@ class MainWindow(QMainWindow):
             self._cluster_centroids = self._compute_centroids(features, labels)
             self._current_labels = labels
             self._current_colours = colours
+            self.cluster_legend.clear_cluster_names()
+            self.cluster_legend.update_clusters(labels, colours)
 
             # Update both views with new labels and colours
             self.graphics_view.update_labels_and_colours(labels, colours)
@@ -4814,6 +4845,7 @@ class MainWindow(QMainWindow):
     def _gui_action_create_agent_region(self, params: Dict[str, Any]) -> Dict[str, Any]:
         patch_indices: Set[int] = set(int(i) for i in params["patch_indices"])
         name = params.get("name")
+        select_dominant_cluster = bool(params.get("select_dominant_cluster", True))
         if not patch_indices or self._current_labels is None:
             return {"error": "No patches or no slide loaded"}
         labels_subset = self._current_labels[sorted(patch_indices)]
@@ -4838,7 +4870,8 @@ class MainWindow(QMainWindow):
         )
         self._labeled_regions[region_id] = region
         self.labeled_regions_widget.add_region(region)
-        self._selected_clusters.add(kmeans_cluster)
+        if select_dominant_cluster:
+            self._selected_clusters.add(kmeans_cluster)
         self._apply_all_labeled_region_styles()
         self._update_labeled_export_action()
         self._sync_app_state_regions()
@@ -4848,6 +4881,7 @@ class MainWindow(QMainWindow):
             "name": auto_name,
             "patch_count": len(patch_indices),
             "kmeans_cluster": kmeans_cluster,
+            "select_dominant_cluster": select_dominant_cluster,
         }
 
     def _gui_action_delete_region(self, params: Dict[str, Any]) -> Dict[str, Any]:

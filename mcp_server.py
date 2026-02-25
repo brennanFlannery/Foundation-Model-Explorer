@@ -812,6 +812,229 @@ def _sample_patch_indices(
     return [int(i) for i in picked.tolist()], score_map, warnings
 
 
+_LAST_OOD_DETECTION: Dict[str, Any] = {}
+
+
+def _compute_knn_scores(
+    candidate_features: np.ndarray,
+    reference_features: np.ndarray,
+    k_neighbors: int,
+    exclude_self: bool = False,
+) -> np.ndarray:
+    """Return mean k-NN distance score for each candidate."""
+    from sklearn.neighbors import NearestNeighbors  # type: ignore
+
+    n_ref = int(len(reference_features))
+    if n_ref < 2:
+        raise ValueError("Reference feature set is too small for k-NN scoring")
+    k = max(1, int(k_neighbors))
+    n_query = k + 1 if exclude_self else k
+    n_query = min(n_query, n_ref)
+
+    nn = NearestNeighbors(n_neighbors=n_query, metric="euclidean")
+    nn.fit(reference_features)
+    dists, _ = nn.kneighbors(candidate_features, return_distance=True)
+    if exclude_self and dists.shape[1] > 1:
+        d_use = dists[:, 1:]
+    else:
+        d_use = dists
+    return d_use.mean(axis=1).astype(float)
+
+
+def _mad_threshold(scores: np.ndarray, robust_z: float) -> float:
+    """Compute robust z-score threshold using MAD."""
+    median = float(np.median(scores))
+    mad = float(np.median(np.abs(scores - median)))
+    if mad < 1e-12:
+        return float(np.max(scores) + 1.0)
+    scale = 1.4826 * mad
+    return median + float(robust_z) * scale
+
+
+def _stable_name_seed(name: str) -> int:
+    """Build a deterministic integer seed from a string."""
+    return sum((i + 1) * ord(ch) for i, ch in enumerate(name))
+
+
+def _select_cohort_slides(
+    all_slide_names: List[str],
+    compatible_slide_names: List[str],
+    slide_selection_mode: Literal["all", "explicit", "first_n", "random_n"],
+    slide_names: Optional[List[str]],
+    max_slides: Optional[int],
+    random_seed: int,
+) -> Tuple[List[str], List[Dict[str, str]], List[str]]:
+    """Select target cohort slides and describe excluded entries."""
+    warnings: List[str] = []
+    skipped: List[Dict[str, str]] = []
+    compatible_set = set(compatible_slide_names)
+
+    if slide_selection_mode == "explicit":
+        requested = [str(s).strip() for s in (slide_names or []) if str(s).strip()]
+        if not requested:
+            raise ValueError("slide_names must be provided when slide_selection_mode='explicit'")
+        selected: List[str] = []
+        seen: set = set()
+        for s in requested:
+            if s in seen:
+                continue
+            seen.add(s)
+            if s not in all_slide_names:
+                skipped.append({"slide_name": s, "reason": "not_found_under_root"})
+                continue
+            if s not in compatible_set:
+                skipped.append({"slide_name": s, "reason": "missing_requested_model_mag_patch"})
+                continue
+            selected.append(s)
+        return selected, skipped, warnings
+
+    selected = list(compatible_slide_names)
+    if slide_selection_mode in {"first_n", "random_n"}:
+        if max_slides is None:
+            raise ValueError("max_slides is required for slide_selection_mode='first_n' or 'random_n'")
+        n_target = max(2, int(max_slides))
+        if len(selected) < n_target:
+            warnings.append(
+                f"Requested {n_target} slides, but only {len(selected)} compatible slides were available"
+            )
+        n_final = min(n_target, len(selected))
+        if slide_selection_mode == "first_n":
+            selected = selected[:n_final]
+        else:
+            rng = np.random.default_rng(int(random_seed))
+            idx = np.arange(len(selected))
+            rng.shuffle(idx)
+            selected = [selected[int(i)] for i in idx[:n_final]]
+
+    incompatible = sorted(set(all_slide_names) - compatible_set)
+    for s in incompatible:
+        skipped.append({"slide_name": s, "reason": "missing_requested_model_mag_patch"})
+    skipped.sort(key=lambda x: x["slide_name"])
+    return selected, skipped, warnings
+
+
+def _compute_js_divergence(
+    p: np.ndarray,
+    q: np.ndarray,
+) -> float:
+    """Compute Jensen-Shannon divergence between two discrete distributions."""
+    p = np.asarray(p, dtype=np.float64)
+    q = np.asarray(q, dtype=np.float64)
+    p = np.clip(p, 1e-12, None)
+    q = np.clip(q, 1e-12, None)
+    p = p / p.sum()
+    q = q / q.sum()
+    m = 0.5 * (p + q)
+    kl_pm = float(np.sum(p * np.log(p / m)))
+    kl_qm = float(np.sum(q * np.log(q / m)))
+    return 0.5 * (kl_pm + kl_qm)
+
+
+def _minmax_norm(values: List[float]) -> List[float]:
+    """Min-max normalize list values to [0, 1]."""
+    if not values:
+        return []
+    vmin = min(values)
+    vmax = max(values)
+    if vmax - vmin < 1e-12:
+        return [0.0 for _ in values]
+    return [(float(v) - vmin) / (vmax - vmin) for v in values]
+
+
+def _collect_cross_slide_reference(
+    state: app_state.AppState,
+    model: Optional[str],
+    mag: Optional[str],
+    patch_size: Optional[str],
+    build_atlas_if_missing: bool,
+) -> Tuple[np.ndarray, List[str], List[str], bool]:
+    """Collect reference features for cross-slide OOD scoring."""
+    warnings: List[str] = []
+    atlas_used = False
+    if state.root_dir is None:
+        raise ValueError("No root directory is loaded")
+    root = _resolve_root(state.root_dir)
+    slides = data_loader.parse_root_directory(str(root))
+
+    selected_model = model or ((state.selected_models or [None])[0] if state.selected_models else None)
+    selected_mag = mag or state.magnification
+    selected_patch = patch_size or state.patch_size
+    if not selected_model or not selected_mag or not selected_patch:
+        raise ValueError("model, mag, and patch_size are required for cross-slide OOD scoring")
+
+    if state.atlas_state is not None and state.atlas_state.slide_names:
+        candidate_slides = list(state.atlas_state.slide_names)
+        atlas_used = True
+    elif build_atlas_if_missing:
+        candidate_slides = sorted(slides.keys())
+        warnings.append("Atlas was missing; generated cross-slide reference from all root slides")
+    else:
+        raise ValueError("No atlas has been built yet")
+
+    target_slide = state.slide_name
+    reference_features: List[np.ndarray] = []
+    used_slides: List[str] = []
+    for sname in candidate_slides:
+        if sname == target_slide:
+            continue
+        if sname not in slides:
+            warnings.append(f"Slide '{sname}' is in atlas list but missing under root_dir")
+            continue
+        info = slides[sname]
+        if selected_model not in info.models:
+            warnings.append(f"Slide '{sname}' skipped: model '{selected_model}' not available")
+            continue
+        if selected_mag not in info.models[selected_model]:
+            warnings.append(f"Slide '{sname}' skipped: mag '{selected_mag}' not available")
+            continue
+        if selected_patch not in info.models[selected_model][selected_mag]:
+            warnings.append(f"Slide '{sname}' skipped: patch_size '{selected_patch}' not available")
+            continue
+        h5_path = Path(info.models[selected_model][selected_mag][selected_patch]).resolve()
+        feats, _, _, _ = _load_features_and_coords(h5_path)
+        reference_features.append(feats)
+        used_slides.append(sname)
+
+    if not reference_features:
+        raise ValueError("No usable reference slides found for cross-slide OOD scoring")
+
+    ref = np.vstack(reference_features).astype(np.float32)
+    return ref, used_slides, warnings, atlas_used
+
+
+def _spatial_components_from_patch_indices(
+    patch_indices: List[int],
+    coords: np.ndarray,
+    patch_size_lv0: float,
+) -> List[List[int]]:
+    """Split patch indices into 4-connected components on grid coordinates."""
+    if not patch_indices:
+        return []
+    step = int(round(float(patch_size_lv0)))
+    idx_set = set(int(i) for i in patch_indices)
+    coord_map = {(int(coords[i, 0]), int(coords[i, 1])): int(i) for i in idx_set}
+    visited: set = set()
+    components: List[List[int]] = []
+
+    for start in sorted(idx_set):
+        if start in visited:
+            continue
+        comp: List[int] = []
+        stack = [start]
+        visited.add(start)
+        while stack:
+            node = stack.pop()
+            comp.append(node)
+            x, y = int(coords[node, 0]), int(coords[node, 1])
+            for nx, ny in ((x + step, y), (x - step, y), (x, y + step), (x, y - step)):
+                nb = coord_map.get((nx, ny))
+                if nb is not None and nb not in visited:
+                    visited.add(nb)
+                    stack.append(nb)
+        components.append(sorted(comp))
+    return components
+
+
 # Dispatch registries
 _REGION_STATS = {
     "spread": _stat_spread,
@@ -1068,6 +1291,11 @@ def compute_cluster_stats(cluster_id: int, metrics: List[ClusterMetric]) -> Dict
 
     return {
         "cluster_id": cluster_id,
+        "color_hex": (
+            state.cluster_colours[int(cluster_id)]
+            if state.cluster_colours is not None and int(cluster_id) < len(state.cluster_colours)
+            else None
+        ),
         "computed": computed,
         "unknown_metrics": unknown,
     }
@@ -1779,6 +2007,65 @@ def find_most_different_cluster(
 
 
 @mcp.tool()
+def find_most_distinct_cluster(
+    metric: Literal["cosine", "euclidean"] = "euclidean",
+    top_k: int = 3,
+) -> Dict[str, Any]:
+    """Rank clusters by distinctness using mean centroid distance to all others."""
+    state = app_state.get()
+    if state.features is None:
+        return {"error": "No slide loaded"}
+    if state.cluster_centroids is None:
+        return {"error": "Cluster centroids not available"}
+    if state.cluster_labels is None:
+        return {"error": "Cluster labels are not available"}
+    if metric not in ("cosine", "euclidean"):
+        return {"error": "metric must be 'cosine' or 'euclidean'"}
+
+    centroids = state.cluster_centroids.astype(np.float32)
+    n_clusters = int(len(centroids))
+    if n_clusters < 2:
+        return {"error": "At least 2 clusters are required"}
+
+    if metric == "cosine":
+        from sklearn.metrics.pairwise import cosine_distances  # type: ignore
+
+        pairwise = cosine_distances(centroids, centroids)
+    else:
+        diff = centroids[:, None, :] - centroids[None, :, :]
+        pairwise = np.linalg.norm(diff, axis=2)
+
+    ranked: List[Dict[str, Any]] = []
+    for cid in range(n_clusters):
+        others = [i for i in range(n_clusters) if i != cid]
+        d = pairwise[cid, others]
+        color_hex = (
+            state.cluster_colours[int(cid)]
+            if state.cluster_colours is not None and int(cid) < len(state.cluster_colours)
+            else None
+        )
+        ranked.append(
+            {
+                "cluster_id": int(cid),
+                "color_hex": color_hex,
+                "mean_distance": round(float(np.mean(d)), 6),
+                "nearest_distance": round(float(np.min(d)), 6),
+                "patch_count": int((state.cluster_labels == cid).sum()),
+            }
+        )
+
+    ranked.sort(key=lambda x: x["mean_distance"], reverse=True)
+    top_n = min(max(1, int(top_k)), len(ranked))
+    top_ranked = ranked[:top_n]
+    return {
+        "metric": metric,
+        "most_distinct_cluster_id": int(top_ranked[0]["cluster_id"]),
+        "ranked_clusters": top_ranked,
+        "note": "Ranked by descending mean centroid distance to all other clusters",
+    }
+
+
+@mcp.tool()
 def find_most_similar_cluster(
     region_id: int,
     metric: str = "cosine",
@@ -2099,6 +2386,235 @@ def highlight_atlas_cluster(cluster_id: int) -> Dict[str, Any]:
 
 
 @mcp.tool()
+def detect_ood_patches(
+    mode: Literal["single_slide", "cross_slide"] = "single_slide",
+    top_k: int = 200,
+    k_neighbors: int = 25,
+    threshold_mode: Literal["quantile", "robust_z", "absolute"] = "quantile",
+    quantile: float = 0.995,
+    robust_z: float = 3.5,
+    absolute_threshold: Optional[float] = None,
+    normalize_embeddings: bool = True,
+    build_atlas_if_missing: bool = True,
+    model: Optional[str] = None,
+    mag: Optional[str] = None,
+    patch_size: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Detect out-of-distribution patches using k-NN embedding distance."""
+    global _LAST_OOD_DETECTION
+
+    state = app_state.get()
+    if state.features is None:
+        return {"error": "No slide loaded"}
+    if state.coords_lv0 is None:
+        return {"error": "No level-0 coordinates available"}
+
+    warnings: List[str] = []
+    candidate_features = state.features.astype(np.float32)
+    if normalize_embeddings:
+        norms = np.linalg.norm(candidate_features, axis=1, keepdims=True)
+        norms = np.clip(norms, 1e-12, None)
+        candidate_features = candidate_features / norms
+
+    if mode == "single_slide":
+        reference = candidate_features
+        used_slides = [state.slide_name or "current_slide"]
+        atlas_used = False
+        exclude_self = True
+    else:
+        try:
+            ref_raw, used_slides, ref_warn, atlas_used = _collect_cross_slide_reference(
+                state=state,
+                model=model,
+                mag=mag,
+                patch_size=patch_size,
+                build_atlas_if_missing=build_atlas_if_missing,
+            )
+        except Exception as exc:
+            return {"error": str(exc)}
+        warnings.extend(ref_warn)
+        reference = ref_raw
+        if normalize_embeddings:
+            rnorm = np.linalg.norm(reference, axis=1, keepdims=True)
+            rnorm = np.clip(rnorm, 1e-12, None)
+            reference = reference / rnorm
+        exclude_self = False
+
+    try:
+        scores = _compute_knn_scores(
+            candidate_features=candidate_features,
+            reference_features=reference,
+            k_neighbors=k_neighbors,
+            exclude_self=exclude_self,
+        )
+    except Exception as exc:
+        return {"error": f"k-NN scoring failed: {exc}"}
+
+    if threshold_mode == "absolute":
+        if absolute_threshold is None:
+            return {"error": "absolute_threshold is required when threshold_mode='absolute'"}
+        threshold = float(absolute_threshold)
+    elif threshold_mode == "robust_z":
+        threshold = _mad_threshold(scores, robust_z=robust_z)
+    else:
+        q = min(max(float(quantile), 0.5), 0.9999)
+        threshold = float(np.quantile(scores, q))
+
+    flagged_mask = scores >= threshold
+    flagged_idx = np.where(flagged_mask)[0].astype(int)
+    if len(flagged_idx) == 0:
+        ranked_idx = np.argsort(scores)[::-1][: min(max(1, top_k), len(scores))]
+    else:
+        ranked_idx = flagged_idx[np.argsort(scores[flagged_idx])[::-1]]
+        ranked_idx = ranked_idx[: min(max(1, top_k), len(ranked_idx))]
+
+    top_outliers: List[Dict[str, Any]] = []
+    for rank_i, idx in enumerate(ranked_idx.tolist(), start=1):
+        entry: Dict[str, Any] = {
+            "rank": rank_i,
+            "patch_index": int(idx),
+            "score": float(scores[idx]),
+            "coords_lv0": {
+                "x": int(state.coords_lv0[idx, 0]),
+                "y": int(state.coords_lv0[idx, 1]),
+            },
+        }
+        if state.cluster_labels is not None:
+            entry["cluster_id"] = int(state.cluster_labels[idx])
+        top_outliers.append(entry)
+
+    outlier_fraction = float(flagged_mask.mean()) if len(flagged_mask) else 0.0
+    if outlier_fraction > 0.05:
+        warnings.append(
+            f"High outlier prevalence ({outlier_fraction * 100:.2f}%) suggests reference mismatch or domain shift"
+        )
+
+    result = {
+        "mode": mode,
+        "method": "knn_distance",
+        "slide_name": state.slide_name,
+        "k_neighbors": int(k_neighbors),
+        "threshold_mode": threshold_mode,
+        "threshold_used": float(threshold),
+        "outlier_count": int(flagged_mask.sum()),
+        "outlier_fraction": outlier_fraction,
+        "reference_patch_count": int(len(reference)),
+        "candidate_patch_count": int(len(candidate_features)),
+        "reference_slides": used_slides,
+        "atlas_used": bool(atlas_used),
+        "top_outliers": top_outliers,
+        "proposed_patch_indices": [int(x["patch_index"]) for x in top_outliers],
+        "score_summary": {
+            "min": float(np.min(scores)),
+            "median": float(np.median(scores)),
+            "mean": float(np.mean(scores)),
+            "max": float(np.max(scores)),
+        },
+        "warnings": warnings,
+    }
+    _LAST_OOD_DETECTION = {
+        "slide_name": state.slide_name,
+        "patch_indices": result["proposed_patch_indices"],
+        "mode": mode,
+    }
+    return result
+
+
+@mcp.tool()
+def label_ood_patches_as_region(
+    patch_indices: Optional[List[int]] = None,
+    from_last_detection: bool = False,
+    grouping_mode: Literal["single_region", "spatial_components"] = "spatial_components",
+    min_component_size: int = 5,
+    name_prefix: str = "OOD",
+) -> Dict[str, Any]:
+    """Create annotated region(s) from OOD patch indices."""
+    global _LAST_OOD_DETECTION
+
+    state = app_state.get()
+    if state.features is None:
+        return {"error": "No slide loaded"}
+
+    if from_last_detection:
+        if not _LAST_OOD_DETECTION:
+            return {"error": "No previous OOD detection result is available"}
+        if _LAST_OOD_DETECTION.get("slide_name") != state.slide_name:
+            return {"error": "Last OOD result belongs to a different slide"}
+        patch_indices = [int(i) for i in _LAST_OOD_DETECTION.get("patch_indices", [])]
+
+    if not patch_indices:
+        return {"error": "patch_indices must be provided or from_last_detection must be true"}
+    uniq = sorted(set(int(i) for i in patch_indices))
+    bad = [i for i in uniq if i < 0 or i >= len(state.features)]
+    if bad:
+        return {"error": f"Out-of-range patch indices: {bad[:10]}"}
+
+    if grouping_mode == "single_region":
+        created = _dispatch_gui_action(
+            "create_agent_region",
+            {
+                "patch_indices": uniq,
+                "name": f"{name_prefix} 1",
+                "source_region_id": None,
+                "select_dominant_cluster": False,
+            },
+        )
+        if "error" in created:
+            return created
+        return {
+            "created_regions": [created],
+            "grouping_mode": grouping_mode,
+            "dropped_components": 0,
+            "total_input_patches": len(uniq),
+            "total_labeled_patches": int(created.get("patch_count", 0)),
+            "exact_match": int(created.get("patch_count", 0)) == len(uniq),
+        }
+
+    if state.coords_lv0 is None:
+        return {"error": "coords_lv0 is required for spatial_components grouping"}
+    if state.patch_size_lv0 is None:
+        return {"error": "patch_size_lv0 is required for spatial_components grouping"}
+
+    components = _spatial_components_from_patch_indices(
+        patch_indices=uniq,
+        coords=state.coords_lv0,
+        patch_size_lv0=state.patch_size_lv0,
+    )
+    min_size = max(1, int(min_component_size))
+    kept = [c for c in components if len(c) >= min_size]
+    dropped = len(components) - len(kept)
+    if not kept:
+        return {"error": "No connected OOD components met min_component_size", "dropped_components": dropped}
+
+    created_regions: List[Dict[str, Any]] = []
+    labeled_total = 0
+    for i, comp in enumerate(kept, start=1):
+        res = _dispatch_gui_action(
+            "create_agent_region",
+            {
+                "patch_indices": comp,
+                "name": f"{name_prefix} {i}",
+                "source_region_id": None,
+                "select_dominant_cluster": False,
+            },
+        )
+        if "error" in res:
+            return {"error": res["error"], "created_regions": created_regions}
+        created_regions.append(res)
+        labeled_total += int(res.get("patch_count", 0))
+
+    return {
+        "created_regions": created_regions,
+        "grouping_mode": grouping_mode,
+        "component_count": len(components),
+        "dropped_components": dropped,
+        "total_input_patches": len(uniq),
+        "total_labeled_patches": labeled_total,
+        "exact_match": labeled_total == len(uniq),
+    }
+
+
+@mcp.tool()
 def open_patch_exemplar_popup(
     source_type: Literal["cluster", "region", "patch_list"],
     source_id: Optional[int] = None,
@@ -2211,6 +2727,10 @@ def generate_slide_qc_report(
     output_path: Optional[str] = None,
     include_recommendations: bool = True,
     cluster_k_candidates: Optional[List[int]] = None,
+    include_ood_assessment: bool = False,
+    ood_mode: Literal["single_slide", "cross_slide"] = "single_slide",
+    ood_top_k: int = 200,
+    ood_k_neighbors: int = 25,
 ) -> Dict[str, Any]:
     """Generate a deterministic QC report (Markdown + JSON summary) for one configuration."""
     root = _resolve_root(root_dir)
@@ -2367,6 +2887,48 @@ def generate_slide_qc_report(
                 }
             )
 
+    ood_summary: Optional[Dict[str, Any]] = None
+    if include_ood_assessment:
+        state = app_state.get()
+        if state.slide_name != slide_name or state.features is None:
+            warnings.append(
+                "OOD assessment skipped: requested slide is not the currently loaded GUI slide"
+            )
+        else:
+            ood_result = detect_ood_patches(
+                mode=ood_mode,
+                top_k=ood_top_k,
+                k_neighbors=ood_k_neighbors,
+                threshold_mode="quantile",
+                quantile=0.995,
+                normalize_embeddings=True,
+                build_atlas_if_missing=True,
+                model=model,
+                mag=mag,
+                patch_size=patch_size,
+            )
+            if "error" in ood_result:
+                warnings.append(f"OOD assessment skipped: {ood_result['error']}")
+            else:
+                ood_summary = {
+                    "enabled": True,
+                    "mode": ood_result.get("mode"),
+                    "method": ood_result.get("method"),
+                    "outlier_count": int(ood_result.get("outlier_count", 0)),
+                    "outlier_fraction": float(ood_result.get("outlier_fraction", 0.0)),
+                    "threshold_used": float(ood_result.get("threshold_used", 0.0)),
+                    "top_examples": (ood_result.get("top_outliers") or [])[:10],
+                    "warnings": ood_result.get("warnings", []),
+                }
+                if include_recommendations and ood_summary["outlier_fraction"] > 0.02:
+                    recommendations.append(
+                        {
+                            "recommendation": "Investigate OOD patches; prevalence is high enough to suggest potential artifact or domain shift.",
+                            "confidence": "medium",
+                            "rationale": "Embedding-space outlier prevalence above 2%",
+                        }
+                    )
+
     summary_json = {
         "slide_name": slide_name,
         "model": model,
@@ -2389,6 +2951,8 @@ def generate_slide_qc_report(
         "warnings": warnings,
         "recommendations": recommendations,
     }
+    if ood_summary is not None:
+        summary_json["ood"] = ood_summary
 
     report_dir = root / "Reports"
     report_dir.mkdir(parents=True, exist_ok=True)
@@ -2464,6 +3028,26 @@ def generate_slide_qc_report(
                 f"- {rec['recommendation']} ({rec['confidence']}; rationale: {rec['rationale']})"
             )
         lines.append("")
+    if ood_summary is not None:
+        lines.extend(
+            [
+                "## OOD Outlier Assessment",
+                f"- Mode: **{ood_summary['mode']}**",
+                f"- Method: **{ood_summary['method']}**",
+                f"- Outlier count: **{ood_summary['outlier_count']}**",
+                f"- Outlier fraction: **{ood_summary['outlier_fraction'] * 100:.2f}%**",
+                f"- Threshold used: **{ood_summary['threshold_used']:.6f}**",
+            ]
+        )
+        top_examples = ood_summary.get("top_examples", [])
+        if top_examples:
+            lines.append("- Top examples:")
+            for entry in top_examples[:5]:
+                coords = entry.get("coords_lv0", {})
+                lines.append(
+                    f"  - patch {entry.get('patch_index')} @ ({coords.get('x')}, {coords.get('y')}), score={float(entry.get('score', 0.0)):.6f}"
+                )
+        lines.append("")
     lines.append("## Warnings / Limitations")
     if warnings:
         for warning in warnings:
@@ -2478,6 +3062,489 @@ def generate_slide_qc_report(
         "report_path": str(final_path),
         "summary_json_path": str(json_path),
         "summary_json": summary_json,
+        "scores": summary_json["scores"],
+        "warnings": warnings,
+    }
+
+
+@mcp.tool()
+def generate_cross_slide_qc_report(
+    root_dir: str,
+    model: str,
+    mag: str,
+    patch_size: str,
+    slide_names: Optional[List[str]] = None,
+    slide_selection_mode: Literal["all", "explicit", "first_n", "random_n"] = "all",
+    max_slides: Optional[int] = None,
+    random_seed: int = 42,
+    atlas_n_clusters: int = 12,
+    normalize_embeddings: bool = True,
+    max_patches_per_slide: int = 50000,
+    ood_k_neighbors: int = 25,
+    ood_threshold_mode: Literal["global_quantile", "global_robust_z", "global_absolute"] = "global_quantile",
+    ood_quantile: float = 0.995,
+    ood_robust_z: float = 3.5,
+    ood_absolute_threshold: Optional[float] = None,
+    top_k_per_slide: int = 100,
+    include_recommendations: bool = True,
+    output_path: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Generate a cross-slide QC report with atlas composition and OOD ranking."""
+    root = _resolve_root(root_dir)
+    slides = data_loader.parse_root_directory(str(root))
+    if not slides:
+        return {"error": f"No slides found under {root}"}
+
+    all_slide_names = sorted(slides.keys())
+    compatible_slide_names: List[str] = []
+    compatibility_warnings: List[str] = []
+    for sname in all_slide_names:
+        info = slides[sname]
+        if model not in info.models:
+            continue
+        if mag not in info.models[model]:
+            continue
+        if patch_size not in info.models[model][mag]:
+            continue
+        compatible_slide_names.append(sname)
+
+    if len(compatible_slide_names) < 2:
+        return {
+            "error": (
+                f"Need at least 2 compatible slides for model={model}, mag={mag}, patch_size={patch_size}. "
+                f"Found {len(compatible_slide_names)}."
+            )
+        }
+
+    try:
+        selected_slides, skipped_slides, selection_warnings = _select_cohort_slides(
+            all_slide_names=all_slide_names,
+            compatible_slide_names=compatible_slide_names,
+            slide_selection_mode=slide_selection_mode,
+            slide_names=slide_names,
+            max_slides=max_slides,
+            random_seed=random_seed,
+        )
+    except Exception as exc:
+        return {"error": str(exc)}
+
+    if len(selected_slides) < 2:
+        return {
+            "error": (
+                f"Slide selection produced {len(selected_slides)} compatible slide(s); at least 2 are required. "
+                "Adjust slide selection mode or filters."
+            )
+        }
+
+    warnings: List[str] = []
+    warnings.extend(compatibility_warnings)
+    warnings.extend(selection_warnings)
+
+    per_slide_features: Dict[str, np.ndarray] = {}
+    per_slide_coords: Dict[str, np.ndarray] = {}
+    per_slide_local_to_original: Dict[str, np.ndarray] = {}
+    per_slide_patch_count_raw: Dict[str, int] = {}
+    per_slide_patch_count_used: Dict[str, int] = {}
+
+    max_patches = max(100, int(max_patches_per_slide))
+    for sname in selected_slides:
+        try:
+            h5_path = _resolve_h5_path(root, sname, model, mag, patch_size)
+            feats, coords, _, _ = _load_features_and_coords(h5_path)
+        except Exception as exc:
+            warnings.append(f"Slide '{sname}' skipped during loading: {exc}")
+            continue
+
+        n_raw = int(len(feats))
+        if n_raw < 2:
+            warnings.append(f"Slide '{sname}' skipped: too few patches ({n_raw})")
+            continue
+        idx = np.arange(n_raw, dtype=int)
+        if n_raw > max_patches:
+            seed = int(random_seed) + _stable_name_seed(sname)
+            rng = np.random.default_rng(seed)
+            idx = np.sort(rng.choice(n_raw, size=max_patches, replace=False).astype(int))
+            warnings.append(
+                f"Slide '{sname}' subsampled from {n_raw} to {len(idx)} patches for cross-slide QC"
+            )
+        feats_used = feats[idx].astype(np.float32)
+        if normalize_embeddings:
+            norms = np.linalg.norm(feats_used, axis=1, keepdims=True)
+            norms = np.clip(norms, 1e-12, None)
+            feats_used = feats_used / norms
+        per_slide_features[sname] = feats_used
+        per_slide_coords[sname] = coords[idx]
+        per_slide_local_to_original[sname] = idx
+        per_slide_patch_count_raw[sname] = n_raw
+        per_slide_patch_count_used[sname] = int(len(idx))
+
+    selected_slides = [s for s in selected_slides if s in per_slide_features]
+    if len(selected_slides) < 2:
+        return {
+            "error": (
+                f"Only {len(selected_slides)} slide(s) remained after loading/subsampling; at least 2 are required."
+            ),
+            "warnings": warnings,
+        }
+
+    # Build atlas composition using pooled features.
+    pooled_features = np.vstack([per_slide_features[s] for s in selected_slides])
+    slide_offsets: Dict[str, Tuple[int, int]] = {}
+    offset = 0
+    for sname in selected_slides:
+        n = len(per_slide_features[sname])
+        slide_offsets[sname] = (offset, offset + n)
+        offset += n
+
+    n_total = int(len(pooled_features))
+    k = max(2, int(atlas_n_clusters))
+    if k > n_total:
+        k = n_total
+        warnings.append(f"atlas_n_clusters capped to {k} (total pooled patches)")
+
+    atlas_labels, _ = _run_clustering(pooled_features, n_clusters=k)
+    global_cluster_counts = np.bincount(atlas_labels, minlength=k).astype(np.float64)
+    global_cluster_dist = global_cluster_counts / max(1.0, float(global_cluster_counts.sum()))
+
+    per_slide_cluster_dist: Dict[str, List[float]] = {}
+    for sname in selected_slides:
+        s0, s1 = slide_offsets[sname]
+        c = np.bincount(atlas_labels[s0:s1], minlength=k).astype(np.float64)
+        c = c / max(1.0, float(c.sum()))
+        per_slide_cluster_dist[sname] = [round(float(x), 6) for x in c.tolist()]
+
+    # Leave-one-slide-out OOD scoring.
+    per_slide_ood_scores: Dict[str, np.ndarray] = {}
+    pooled_ood_scores: List[np.ndarray] = []
+    k_neighbors = max(1, int(ood_k_neighbors))
+    for sname in selected_slides:
+        cand = per_slide_features[sname]
+        refs = [per_slide_features[other] for other in selected_slides if other != sname]
+        ref = np.vstack(refs)
+        try:
+            scores = _compute_knn_scores(
+                candidate_features=cand,
+                reference_features=ref,
+                k_neighbors=k_neighbors,
+                exclude_self=False,
+            )
+        except Exception as exc:
+            return {"error": f"Cross-slide k-NN scoring failed for slide '{sname}': {exc}"}
+        per_slide_ood_scores[sname] = scores
+        pooled_ood_scores.append(scores)
+
+    pooled_scores = np.concatenate(pooled_ood_scores).astype(float)
+    if ood_threshold_mode == "global_absolute":
+        if ood_absolute_threshold is None:
+            return {"error": "ood_absolute_threshold is required when ood_threshold_mode='global_absolute'"}
+        threshold_used = float(ood_absolute_threshold)
+    elif ood_threshold_mode == "global_robust_z":
+        threshold_used = _mad_threshold(pooled_scores, robust_z=float(ood_robust_z))
+    else:
+        q = min(max(float(ood_quantile), 0.5), 0.9999)
+        threshold_used = float(np.quantile(pooled_scores, q))
+
+    top_k = max(1, int(top_k_per_slide))
+    per_slide_ood_rows: List[Dict[str, Any]] = []
+    for sname in selected_slides:
+        scores = per_slide_ood_scores[sname]
+        outlier_mask = scores >= threshold_used
+        ranked_idx = np.argsort(scores)[::-1][: min(top_k, len(scores))]
+        top_outliers: List[Dict[str, Any]] = []
+        local_to_orig = per_slide_local_to_original[sname]
+        coords = per_slide_coords[sname]
+        for i_rank, local_idx in enumerate(ranked_idx.tolist(), start=1):
+            orig_idx = int(local_to_orig[local_idx])
+            top_outliers.append(
+                {
+                    "rank": i_rank,
+                    "local_patch_index": int(local_idx),
+                    "patch_index": orig_idx,
+                    "score": float(scores[local_idx]),
+                    "coords_lv0": {
+                        "x": int(coords[local_idx, 0]),
+                        "y": int(coords[local_idx, 1]),
+                    },
+                }
+            )
+        per_slide_ood_rows.append(
+            {
+                "slide_name": sname,
+                "outlier_count": int(outlier_mask.sum()),
+                "outlier_fraction": float(outlier_mask.mean()),
+                "score_summary": {
+                    "mean": float(np.mean(scores)),
+                    "median": float(np.median(scores)),
+                    "p95": float(np.quantile(scores, 0.95)),
+                    "p99": float(np.quantile(scores, 0.99)),
+                    "max": float(np.max(scores)),
+                },
+                "top_outliers": top_outliers,
+            }
+        )
+
+    per_slide_ood_rows.sort(
+        key=lambda x: (x["outlier_fraction"], x["outlier_count"]), reverse=True
+    )
+    most_ood_by_fraction = per_slide_ood_rows[0] if per_slide_ood_rows else None
+    most_ood_by_count = sorted(
+        per_slide_ood_rows, key=lambda x: x["outlier_count"], reverse=True
+    )[0] if per_slide_ood_rows else None
+
+    # Additional cross-slide metrics.
+    cohort_centroid = pooled_features.mean(axis=0)
+    per_slide_metrics: List[Dict[str, Any]] = []
+    rare_clusters = np.where(global_cluster_dist <= 0.02)[0].tolist()
+    for sname in selected_slides:
+        feats = per_slide_features[sname]
+        centroid = feats.mean(axis=0)
+        embedding_shift = float(np.linalg.norm(centroid - cohort_centroid))
+        slide_dist = np.array(per_slide_cluster_dist[sname], dtype=np.float64)
+        jsd = float(_compute_js_divergence(slide_dist, global_cluster_dist))
+
+        s0, s1 = slide_offsets[sname]
+        local_labels = atlas_labels[s0:s1]
+        rare_burden = 0.0
+        if rare_clusters:
+            rare_burden = float(np.mean(np.isin(local_labels, rare_clusters)))
+
+        try:
+            within_disp_scores = _compute_knn_scores(
+                candidate_features=feats,
+                reference_features=feats,
+                k_neighbors=min(k_neighbors, max(1, len(feats) - 1)),
+                exclude_self=True,
+            )
+            within_dispersion = float(np.median(within_disp_scores))
+        except Exception:
+            within_dispersion = float(np.nan)
+            warnings.append(f"within-slide dispersion failed for slide '{sname}'")
+
+        coverage = int(np.sum(np.bincount(local_labels, minlength=k) > 0))
+        per_slide_metrics.append(
+            {
+                "slide_name": sname,
+                "embedding_shift_distance": embedding_shift,
+                "distribution_js_divergence": jsd,
+                "rare_cluster_burden": rare_burden,
+                "within_slide_dispersion": within_dispersion,
+                "effective_cluster_coverage": coverage,
+            }
+        )
+
+    # Composite risk score and grading.
+    metric_by_slide = {row["slide_name"]: row for row in per_slide_metrics}
+    ood_by_slide = {row["slide_name"]: row for row in per_slide_ood_rows}
+    metric_order = selected_slides
+
+    ood_values = [ood_by_slide[s]["outlier_fraction"] for s in metric_order]
+    shift_values = [metric_by_slide[s]["embedding_shift_distance"] for s in metric_order]
+    jsd_values = [metric_by_slide[s]["distribution_js_divergence"] for s in metric_order]
+    rare_values = [metric_by_slide[s]["rare_cluster_burden"] for s in metric_order]
+    disp_values = [metric_by_slide[s]["within_slide_dispersion"] for s in metric_order]
+    disp_values_clean = []
+    finite_disp = [float(v) for v in disp_values if np.isfinite(v)]
+    fallback_disp = float(np.median(finite_disp)) if finite_disp else 0.0
+    for v in disp_values:
+        disp_values_clean.append(float(v) if np.isfinite(v) else fallback_disp)
+    cov_values = [float(metric_by_slide[s]["effective_cluster_coverage"]) for s in metric_order]
+
+    ood_norm = _minmax_norm(ood_values)
+    shift_norm = _minmax_norm(shift_values)
+    jsd_norm = _minmax_norm(jsd_values)
+    rare_norm = _minmax_norm(rare_values)
+    disp_norm = _minmax_norm(disp_values_clean)
+    cov_norm = _minmax_norm(cov_values)
+
+    per_slide_scores: List[Dict[str, Any]] = []
+    for i, sname in enumerate(metric_order):
+        risk_0_1 = (
+            0.40 * ood_norm[i]
+            + 0.20 * shift_norm[i]
+            + 0.20 * jsd_norm[i]
+            + 0.10 * rare_norm[i]
+            + 0.10 * (0.5 * disp_norm[i] + 0.5 * (1.0 - cov_norm[i]))
+        )
+        qc_score = _clip_score((1.0 - risk_0_1) * 100.0)
+        if qc_score >= 85:
+            grade = "A"
+        elif qc_score >= 70:
+            grade = "B"
+        elif qc_score >= 55:
+            grade = "C"
+        else:
+            grade = "D"
+        per_slide_scores.append(
+            {
+                "slide_name": sname,
+                "cross_slide_qc_score": round(float(qc_score), 2),
+                "grade": grade,
+            }
+        )
+    per_slide_scores.sort(key=lambda x: x["cross_slide_qc_score"], reverse=True)
+    for rank_i, row in enumerate(per_slide_scores, start=1):
+        row["rank"] = rank_i
+
+    recommendations: List[Dict[str, str]] = []
+    if include_recommendations and most_ood_by_fraction is not None:
+        if float(most_ood_by_fraction["outlier_fraction"]) > 0.03:
+            recommendations.append(
+                {
+                    "recommendation": (
+                        f"Prioritize review of slide '{most_ood_by_fraction['slide_name']}' "
+                        "because cross-slide OOD fraction is elevated."
+                    ),
+                    "confidence": "high",
+                    "rationale": "Highest leave-one-slide-out OOD fraction",
+                }
+            )
+        if rare_clusters:
+            recommendations.append(
+                {
+                    "recommendation": (
+                        "Inspect rare-cluster burden and top OOD patches together to separate "
+                        "true artifacts from biologically rare tissue patterns."
+                    ),
+                    "confidence": "medium",
+                    "rationale": "Rare atlas clusters were detected in the cohort",
+                }
+            )
+
+    summary_json: Dict[str, Any] = {
+        "cohort": {
+            "root_dir": str(root),
+            "model": model,
+            "mag": mag,
+            "patch_size": patch_size,
+            "slide_selection_mode": slide_selection_mode,
+            "selected_slides": selected_slides,
+            "n_selected_slides": len(selected_slides),
+            "skipped_slides": skipped_slides,
+            "per_slide_patch_count_raw": per_slide_patch_count_raw,
+            "per_slide_patch_count_used": per_slide_patch_count_used,
+        },
+        "atlas_summary": {
+            "n_clusters": int(k),
+            "total_patches": int(n_total),
+            "global_cluster_distribution": [round(float(x), 6) for x in global_cluster_dist.tolist()],
+            "per_slide_cluster_distribution": per_slide_cluster_dist,
+        },
+        "ood_summary": {
+            "method": "leave_one_slide_out_knn_distance",
+            "k_neighbors": int(k_neighbors),
+            "threshold_mode": ood_threshold_mode,
+            "threshold_used": float(threshold_used),
+            "slides_ranked_by_outlier_fraction": per_slide_ood_rows,
+            "most_ood_slide_by_fraction": {
+                "slide_name": most_ood_by_fraction["slide_name"],
+                "outlier_fraction": most_ood_by_fraction["outlier_fraction"],
+                "outlier_count": most_ood_by_fraction["outlier_count"],
+            } if most_ood_by_fraction is not None else None,
+            "most_ood_slide_by_count": {
+                "slide_name": most_ood_by_count["slide_name"],
+                "outlier_fraction": most_ood_by_count["outlier_fraction"],
+                "outlier_count": most_ood_by_count["outlier_count"],
+            } if most_ood_by_count is not None else None,
+        },
+        "cross_slide_metrics": per_slide_metrics,
+        "scores": {
+            "per_slide": per_slide_scores,
+        },
+        "warnings": warnings,
+        "recommendations": recommendations,
+    }
+
+    report_dir = root / "Reports"
+    report_dir.mkdir(parents=True, exist_ok=True)
+    default_name = (
+        f"cross_slide_qc_{model}_{mag}_{patch_size}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.md"
+    )
+    final_path = Path(output_path).expanduser() if output_path else (report_dir / default_name)
+    if not final_path.is_absolute():
+        final_path = (Path.cwd() / final_path).resolve()
+    final_path.parent.mkdir(parents=True, exist_ok=True)
+
+    lines: List[str] = [
+        f"# Cross-Slide QC Report: {model} | {mag} | {patch_size}",
+        "",
+        "## Run Metadata",
+        f"- Generated: {datetime.now().isoformat(timespec='seconds')}",
+        f"- Root directory: `{str(root)}`",
+        f"- Slide selection mode: **{slide_selection_mode}**",
+        f"- Included slides: **{len(selected_slides)}**",
+        "",
+        "## Cohort Slides",
+    ]
+    for sname in selected_slides:
+        lines.append(
+            f"- {sname}: raw={per_slide_patch_count_raw[sname]}, used={per_slide_patch_count_used[sname]}"
+        )
+    lines.extend(
+        [
+            "",
+            "## Atlas Summary",
+            f"- Atlas clusters: **{k}**",
+            f"- Total pooled patches: **{n_total}**",
+            "",
+            "## OOD Ranking (Leave-One-Slide-Out)",
+            "| slide | outlier_fraction | outlier_count | mean_score | p99_score |",
+            "|---|---:|---:|---:|---:|",
+        ]
+    )
+    for row in per_slide_ood_rows:
+        ss = row["score_summary"]
+        lines.append(
+            f"| {row['slide_name']} | {row['outlier_fraction']:.4f} | {row['outlier_count']} | "
+            f"{ss['mean']:.6f} | {ss['p99']:.6f} |"
+        )
+    lines.extend(
+        [
+            "",
+            "## Additional Cross-Slide Metrics",
+            "| slide | embedding_shift | js_divergence | rare_cluster_burden | within_dispersion | cluster_coverage |",
+            "|---|---:|---:|---:|---:|---:|",
+        ]
+    )
+    for row in per_slide_metrics:
+        lines.append(
+            f"| {row['slide_name']} | {row['embedding_shift_distance']:.6f} | "
+            f"{row['distribution_js_divergence']:.6f} | {row['rare_cluster_burden']:.4f} | "
+            f"{row['within_slide_dispersion']:.6f} | {row['effective_cluster_coverage']} |"
+        )
+    lines.extend(
+        [
+            "",
+            "## Cross-Slide QC Scores",
+            "| rank | slide | score | grade |",
+            "|---:|---|---:|---:|",
+        ]
+    )
+    for row in per_slide_scores:
+        lines.append(
+            f"| {row['rank']} | {row['slide_name']} | {row['cross_slide_qc_score']:.2f} | {row['grade']} |"
+        )
+    if recommendations:
+        lines.extend(["", "## Recommendations"])
+        for rec in recommendations:
+            lines.append(
+                f"- {rec['recommendation']} ({rec['confidence']}; rationale: {rec['rationale']})"
+            )
+    lines.extend(["", "## Warnings / Limitations"])
+    if warnings:
+        for warning in warnings:
+            lines.append(f"- {warning}")
+    else:
+        lines.append("- None")
+
+    final_path.write_text("\n".join(lines), encoding="utf-8")
+    json_path = final_path.with_suffix(".json")
+    json_path.write_text(json.dumps(summary_json, indent=2), encoding="utf-8")
+
+    return {
+        "report_path": str(final_path),
+        "summary_json_path": str(json_path),
+        "summary_json": summary_json,
+        "most_ood_slide": summary_json["ood_summary"]["most_ood_slide_by_fraction"],
         "scores": summary_json["scores"],
         "warnings": warnings,
     }

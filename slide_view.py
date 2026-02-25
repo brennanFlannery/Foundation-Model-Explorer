@@ -738,6 +738,9 @@ class SlideGraphicsView(QGraphicsView):
             return
         super().mousePressEvent(event)
 
+        if event.button() != Qt.MouseButton.LeftButton:
+            return
+
         if self._suppress_clicks:
             return
 
